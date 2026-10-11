@@ -996,6 +996,7 @@ async def send_broadcast_message(user_id, text, parse_mode=None):
         return False
 
 @dp.message(Command("start"))
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     first_name = message.from_user.first_name
@@ -1006,18 +1007,90 @@ async def cmd_start(message: types.Message):
     await cleanup_user_messages(user_id)
 
     args = message.text.split()
-    if len(args) > 1 and args[1] == "join_lobby":
-        if db.is_user_registered(user_id):
-            await send_message_with_image(message.chat.id,
-                                        f"{pe('🎮')} Добро пожаловать! Вы перешли по ссылке присоединения к лобби.\n\nВыберите действие:",
-                                        MENU_IMAGE_URL,
-                                        get_main_keyboard(user_id))
-        else:
+    if len(args) > 1 and args[1].startswith("join_lobby"):
+        # Разбираем: "join_lobby" или "join_lobby_ABC12"
+        parts = args[1].split("_")
+        lobby_unique_id = parts[2] if len(parts) >= 3 else None
+
+        if not db.is_user_registered(user_id):
             await message.answer(
                 f"{pe('👋')} Привет, {first_name}!\n\nДля участия в лобби нужно зарегистрироваться:",
                 reply_markup=get_registration_keyboard(),
                 parse_mode='HTML'
             )
+            return
+
+        if lobby_unique_id:
+            # Ищем лобби по его уникальному ID среди активных
+            lobbies = db.get_active_lobbies()
+            target_lobby = None
+            for lob in lobbies:
+                if lob[1] == lobby_unique_id:  # lob[1] = lobby_unique_id
+                    target_lobby = lob
+                    break
+
+            if not target_lobby:
+                if lobbies:
+                    await send_message_with_image(
+                        message.chat.id,
+                        f"{pe('❌')} Лобби #{lobby_unique_id} больше не активно.\n\nВыберите другое:",
+                        MENU_IMAGE_URL,
+                        get_lobby_list_keyboard(lobbies)
+                    )
+                else:
+                    await send_message_with_image(
+                        message.chat.id,
+                        f"{pe('❌')} Лобби #{lobby_unique_id} больше не активно.\n\n{pe('❌')} Нет активных лобби",
+                        MENU_IMAGE_URL,
+                        get_lobbies_keyboard()
+                    )
+                return
+
+            # Показываем карточку конкретного лобби
+            lobby_id = target_lobby[0]
+            lobby_info = db.get_lobby_by_id(lobby_id)
+            players = db.get_lobby_players(lobby_id)
+            is_creator = lobby_info[2] == user_id
+            players_count = len(players)
+            max_players = lobby_info[9]
+            lobby_full = players_count >= max_players
+
+            creator_user_info = await bot.get_chat(lobby_info[2])
+            creator_first_name = creator_user_info.first_name if creator_user_info else None
+            lobby_text, _ = format_lobby_info(lobby_info, players, creator_first_name)
+
+            await cleanup_user_messages(user_id)
+            new_message = await bot.send_message(
+                chat_id=user_id,
+                text=lobby_text,
+                reply_markup=get_lobby_actions_keyboard(
+                    lobby_id,
+                    user_id,
+                    is_creator=is_creator,
+                    players_count=players_count,
+                    max_players=max_players,
+                    lobby_full=lobby_full
+                ),
+                parse_mode='HTML'
+            )
+            user_lobby_messages.put(user_id, new_message.message_id)
+        else:
+            # Старый формат ссылки (без lobby_id) — просто список лобби
+            lobbies = db.get_active_lobbies()
+            if not lobbies:
+                await send_message_with_image(
+                    message.chat.id,
+                    f"{pe('🎮')} Активные лобби\n\n{pe('❌')} Нет активных лобби",
+                    MENU_IMAGE_URL,
+                    get_lobbies_keyboard()
+                )
+            else:
+                await send_message_with_image(
+                    message.chat.id,
+                    f"{pe('🎮')} Активные лобби\n\nВыберите лобби для просмотра:",
+                    MENU_IMAGE_URL,
+                    get_lobby_list_keyboard(lobbies)
+                )
         return
 
     if db.is_user_registered(user_id):
@@ -1035,7 +1108,6 @@ async def cmd_start(message: types.Message):
             parse_mode='HTML'
         )
         user_menu_messages.put(user_id, start_message.message_id)
-
 @dp.message(Command("profile"))
 async def cmd_profile(message: types.Message):
     await show_profile_from_message(message)
