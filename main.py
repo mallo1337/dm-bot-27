@@ -858,7 +858,7 @@ async def send_lobby_to_channel(lobby_id):
 
         join_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
-        [btn("🎮 Присоединиться к лобби", url=f"https://t.me/KingDM_robot?start=join_lobby_{lobby_unique_id}", icon="🎮")]
+        [btn("🎮 Присоединиться к лобби", url=f"https://t.me/KingDM_rubot?start=join_lobby_{lobby_unique_id}", icon="🎮")]
     ]
 )
 
