@@ -153,6 +153,8 @@ class Database:
             self.conn.commit()
             self._migrate_players_profile_premium()
             self._migrate_owner_panel_tables()
+            self._migrate_monetization_tables()
+            self._migrate_faceit_tables()
             logger.info("Tables created successfully")
         except Exception as e:
             logger.error(f"Error creating tables: {e}")
@@ -194,6 +196,12 @@ class Database:
                     target_id BIGINT,
                     details TEXT,
                     created_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS match_result_posts (
+                    lobby_id INTEGER PRIMARY KEY,
+                    posted_at TEXT
                 )
             ''')
             self.conn.commit()
@@ -299,8 +307,8 @@ class Database:
             self.conn.rollback()
             return False
 
-    def grant_premium_days(self, user_id, days):
-        """Выдаёт дни Premium вручную (без бонуса +100 рейтинга). Возвращает новую дату окончания или None."""
+    def grant_premium_days(self, user_id, days, provider="owner_grant", ref=None, bonus_rating=0):
+        """Выдаёт дни Premium вручную или по промокоду (без бонуса +100 рейтинга). Возвращает новую дату окончания или None."""
         try:
             self.ensure_connection()
             self.cursor.execute("SELECT premium_until FROM players WHERE user_id = %s", (user_id,))
@@ -319,9 +327,11 @@ class Database:
                     pass
             new_until = (base + timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
             self.cursor.execute("UPDATE players SET premium_until = %s WHERE user_id = %s", (new_until, user_id))
+            if bonus_rating:
+                self.cursor.execute("UPDATE player_stats SET rating = rating + %s WHERE user_id = %s", (int(bonus_rating), user_id))
             self.cursor.execute(
                 "INSERT INTO premium_transactions (user_id, days, provider, provider_ref, created_at) VALUES (%s, %s, %s, %s, %s)",
-                (user_id, int(days), "owner_grant", f"owner_grant_{user_id}_{int(now.timestamp() * 1000)}", self._now_str()),
+                (user_id, int(days), provider, ref or f"{provider}_{user_id}_{int(now.timestamp() * 1000)}", self._now_str()),
             )
             self.conn.commit()
             return new_until
@@ -360,19 +370,1015 @@ class Database:
                 "players_total": one("SELECT COUNT(*) FROM players"),
                 "players_24h": one("SELECT COUNT(*) FROM players WHERE registration_date >= %s", (day_ago,)),
                 "players_7d": one("SELECT COUNT(*) FROM players WHERE registration_date >= %s", (week_ago,)),
-                "lobbies_total": one("SELECT COUNT(*) FROM lobbies"),
-                "lobbies_active": one("SELECT COUNT(*) FROM lobbies WHERE status = 'active'"),
-                "lobbies_completed": one("SELECT COUNT(*) FROM lobbies WHERE status = 'completed'"),
-                "lobbies_today": one("SELECT COUNT(*) FROM lobbies WHERE created_at >= %s", (today,)),
-                "stats_entries": one("SELECT COUNT(*) FROM stats_history"),
+                "lobbies_total": one("SELECT COUNT(*) FROM fc_lobbies WHERE status <> 'open'"),
+                "lobbies_active": one("SELECT COUNT(*) FROM fc_lobbies WHERE status IN ('open', 'draft', 'live')"),
+                "lobbies_completed": one("SELECT COUNT(*) FROM fc_lobbies WHERE status = 'finished'"),
+                "lobbies_today": one("SELECT COUNT(*) FROM fc_lobbies WHERE status <> 'open' AND created_at >= %s", (today,)),
+                "stats_entries": one("SELECT COUNT(*) FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id WHERE l.status = 'finished'"),
                 "premium_active": one("SELECT COUNT(*) FROM players WHERE premium_until IS NOT NULL AND premium_until > %s", (now_s,)),
-                "premium_buys_30d": one("SELECT COUNT(*) FROM premium_transactions WHERE provider <> 'owner_grant' AND created_at >= %s", (month_ago,)),
-                "premium_buys_total": one("SELECT COUNT(*) FROM premium_transactions WHERE provider <> 'owner_grant'"),
+                "premium_buys_30d": one("SELECT COUNT(*) FROM premium_transactions WHERE provider IN ('cryptobot', 'telegram_stars') AND created_at >= %s", (month_ago,)),
+                "premium_buys_total": one("SELECT COUNT(*) FROM premium_transactions WHERE provider IN ('cryptobot', 'telegram_stars')"),
             }
             self.conn.commit()
             return stats
         except Exception as e:
             logger.error(f"Error getting admin stats: {e}")
+            self.conn.rollback()
+            return None
+
+    # ---------- итоги матча ----------
+    def get_lobby_match_results(self, lobby_id):
+        """[(user_id, nickname, kills, deaths, rating_added)] — по убыванию убийств."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT sh.user_id, p.nickname, sh.kills_added, sh.deaths_added, sh.rating_added
+                   FROM stats_history sh JOIN players p ON p.user_id = sh.user_id
+                   WHERE sh.lobby_id = %s
+                   ORDER BY sh.kills_added DESC, sh.deaths_added ASC""",
+                (lobby_id,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"Error getting match results for lobby {lobby_id}: {e}")
+            self.conn.rollback()
+            return []
+
+    def mark_match_posted(self, lobby_id):
+        """True — отметили впервые (можно публиковать), False — уже публиковали."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "INSERT INTO match_result_posts (lobby_id, posted_at) VALUES (%s, %s) ON CONFLICT (lobby_id) DO NOTHING RETURNING lobby_id",
+                (lobby_id, self._now_str()),
+            )
+            first = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return first
+        except Exception as e:
+            logger.error(f"Error marking match posted {lobby_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def unmark_match_posted(self, lobby_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("DELETE FROM match_result_posts WHERE lobby_id = %s", (lobby_id,))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error unmarking match posted {lobby_id}: {e}")
+            self.conn.rollback()
+
+    def _migrate_monetization_tables(self):
+        """Промокоды, заказы Premium (счета CryptoBot/Stars), хранилище состояний диалогов и служебные значения."""
+        try:
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS promo_codes (
+                    code TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    value INTEGER NOT NULL,
+                    max_uses INTEGER DEFAULT 1,
+                    uses INTEGER DEFAULT 0,
+                    expires_at TEXT,
+                    active BOOLEAN DEFAULT TRUE,
+                    created_by BIGINT,
+                    created_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS promo_redemptions (
+                    id SERIAL PRIMARY KEY,
+                    code TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    kind TEXT,
+                    value INTEGER,
+                    redeemed_at TEXT,
+                    applied_order_id INTEGER,
+                    UNIQUE (code, user_id)
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS premium_orders (
+                    id SERIAL PRIMARY KEY,
+                    provider TEXT,
+                    provider_ref TEXT,
+                    invoice_id BIGINT,
+                    buyer_id BIGINT NOT NULL,
+                    recipient_id BIGINT NOT NULL,
+                    days INTEGER NOT NULL,
+                    price_usd TEXT,
+                    price_stars INTEGER,
+                    discount_percent INTEGER DEFAULT 0,
+                    promo_code TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TEXT,
+                    paid_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fsm_storage (
+                    key TEXT PRIMARY KEY,
+                    state TEXT,
+                    data TEXT,
+                    updated_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bot_kv (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT
+                )
+            ''')
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_buyer ON premium_orders(buyer_id)")
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_invoice ON premium_orders(invoice_id)")
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Migration monetization tables failed: {e}")
+            self.conn.rollback()
+
+    # ---------- служебные значения (kv) ----------
+    def kv_set(self, key, value):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO bot_kv (key, value, updated_at) VALUES (%s, %s, %s)
+                   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at""",
+                (key, str(value), self._now_str()),
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error kv_set {key}: {e}")
+            self.conn.rollback()
+            return False
+
+    def kv_get(self, key):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT value FROM bot_kv WHERE key = %s", (key,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error kv_get {key}: {e}")
+            self.conn.rollback()
+            return None
+
+    def kv_delete(self, key):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("DELETE FROM bot_kv WHERE key = %s", (key,))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error kv_delete {key}: {e}")
+            self.conn.rollback()
+
+    # ---------- хранилище состояний диалогов (FSM) ----------
+    def fsm_get(self, key):
+        """Возвращает (state, data_json)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT state, data FROM fsm_storage WHERE key = %s", (key,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            if not row:
+                return None, "{}"
+            return row[0], row[1] or "{}"
+        except Exception as e:
+            logger.error(f"Error fsm_get {key}: {e}")
+            self.conn.rollback()
+            return None, "{}"
+
+    def _fsm_cleanup(self, key):
+        self.cursor.execute("DELETE FROM fsm_storage WHERE key = %s AND state IS NULL AND (data IS NULL OR data = '{}')", (key,))
+
+    def fsm_set_state(self, key, state):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO fsm_storage (key, state, data, updated_at) VALUES (%s, %s, '{}', %s)
+                   ON CONFLICT (key) DO UPDATE SET state = EXCLUDED.state, updated_at = EXCLUDED.updated_at""",
+                (key, state, self._now_str()),
+            )
+            self._fsm_cleanup(key)
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error fsm_set_state {key}: {e}")
+            self.conn.rollback()
+
+    def fsm_set_data(self, key, data_json):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO fsm_storage (key, state, data, updated_at) VALUES (%s, NULL, %s, %s)
+                   ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at""",
+                (key, data_json, self._now_str()),
+            )
+            self._fsm_cleanup(key)
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error fsm_set_data {key}: {e}")
+            self.conn.rollback()
+
+    # ---------- промокоды ----------
+    def create_promo(self, code, kind, value, max_uses, valid_days, created_by):
+        """Возвращает (True, None) или (False, текст ошибки)."""
+        try:
+            self.ensure_connection()
+            expires_at = None
+            if valid_days:
+                expires_at = (datetime.now() + timedelta(days=int(valid_days))).strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute(
+                """INSERT INTO promo_codes (code, kind, value, max_uses, expires_at, created_by, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (code) DO NOTHING RETURNING code""",
+                (code, kind, int(value), int(max_uses), expires_at, created_by, self._now_str()),
+            )
+            created = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return (True, None) if created else (False, "Такой код уже существует.")
+        except Exception as e:
+            logger.error(f"Error creating promo {code}: {e}")
+            self.conn.rollback()
+            return False, "Ошибка базы данных."
+
+    def list_promos(self, limit=15):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "SELECT code, kind, value, max_uses, uses, expires_at, active FROM promo_codes ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"Error listing promos: {e}")
+            self.conn.rollback()
+            return []
+
+    def toggle_promo(self, code):
+        """Включает/выключает код. Возвращает новое состояние (True/False) или None, если кода нет."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT active FROM promo_codes WHERE code = %s", (code,))
+            row = self.cursor.fetchone()
+            if not row:
+                self.conn.commit()
+                return None
+            new_state = not bool(row[0])
+            self.cursor.execute("UPDATE promo_codes SET active = %s WHERE code = %s", (new_state, code))
+            self.conn.commit()
+            return new_state
+        except Exception as e:
+            logger.error(f"Error toggling promo {code}: {e}")
+            self.conn.rollback()
+            return None
+
+    def redeem_promo(self, user_id, code):
+        """Активирует код для игрока. Возвращает (kind, value, ошибка); ошибка=None при успехе."""
+        code = (code or "").strip().upper()
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT kind, value, max_uses, uses, expires_at, active FROM promo_codes WHERE code = %s", (code,))
+            row = c.fetchone()
+            if not row:
+                self.conn.commit()
+                return None, None, "Такого промокода нет."
+            kind, value, max_uses, uses, expires_at, active = row
+            if not active:
+                self.conn.commit()
+                return None, None, "Этот промокод отключён."
+            if expires_at and expires_at <= self._now_str():
+                self.conn.commit()
+                return None, None, "Срок действия промокода истёк."
+            if max_uses and uses >= max_uses:
+                self.conn.commit()
+                return None, None, "Промокод уже использован максимальное число раз."
+            c.execute(
+                """INSERT INTO promo_redemptions (code, user_id, kind, value, redeemed_at)
+                   VALUES (%s, %s, %s, %s, %s) ON CONFLICT (code, user_id) DO NOTHING RETURNING id""",
+                (code, user_id, kind, value, self._now_str()),
+            )
+            if c.fetchone() is None:
+                self.conn.commit()
+                return None, None, "Вы уже использовали этот промокод."
+            c.execute(
+                "UPDATE promo_codes SET uses = uses + 1 WHERE code = %s AND (max_uses = 0 OR uses < max_uses) RETURNING uses",
+                (code,),
+            )
+            if c.fetchone() is None:
+                self.conn.rollback()
+                return None, None, "Промокод уже использован максимальное число раз."
+            self.conn.commit()
+            return kind, value, None
+        except Exception as e:
+            logger.error(f"Error redeeming promo {code} for {user_id}: {e}")
+            self.conn.rollback()
+            return None, None, "Ошибка базы данных, попробуйте позже."
+
+    def cancel_promo_redemption(self, user_id, code):
+        """Откатывает активацию (если не удалось выдать награду)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("DELETE FROM promo_redemptions WHERE code = %s AND user_id = %s RETURNING id", ((code or "").upper(), user_id))
+            if self.cursor.fetchone() is not None:
+                self.cursor.execute("UPDATE promo_codes SET uses = GREATEST(0, uses - 1) WHERE code = %s", ((code or "").upper(),))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error cancelling promo redemption {code}/{user_id}: {e}")
+            self.conn.rollback()
+
+    def get_best_pending_promo_discount(self, user_id):
+        """Лучшая активированная, но ещё не использованная скидка: (code, percent) или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT code, value FROM promo_redemptions
+                   WHERE user_id = %s AND kind = 'percent' AND applied_order_id IS NULL
+                   ORDER BY value DESC LIMIT 1""",
+                (user_id,),
+            )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return (row[0], row[1]) if row else None
+        except Exception as e:
+            logger.error(f"Error getting promo discount for {user_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def mark_promo_applied(self, user_id, code, order_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE promo_redemptions SET applied_order_id = %s WHERE user_id = %s AND code = %s AND applied_order_id IS NULL",
+                (order_id, user_id, code),
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error marking promo applied {code}/{user_id}: {e}")
+            self.conn.rollback()
+
+    # ---------- заказы Premium ----------
+    def create_premium_order(self, provider, buyer_id, recipient_id, days, price_usd, price_stars, discount_percent, promo_code):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO premium_orders (provider, buyer_id, recipient_id, days, price_usd, price_stars,
+                                               discount_percent, promo_code, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (provider, buyer_id, recipient_id, days, str(price_usd), int(price_stars), int(discount_percent), promo_code, self._now_str()),
+            )
+            order_id = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return order_id
+        except Exception as e:
+            logger.error(f"Error creating premium order: {e}")
+            self.conn.rollback()
+            return None
+
+    def set_order_invoice(self, order_id, invoice_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("UPDATE premium_orders SET invoice_id = %s WHERE id = %s", (int(invoice_id), order_id))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error setting order invoice: {e}")
+            self.conn.rollback()
+            return False
+
+    def get_premium_order(self, order_id):
+        """(id, provider, provider_ref, invoice_id, buyer_id, recipient_id, days, price_usd, price_stars,
+            discount_percent, promo_code, status) или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT id, provider, provider_ref, invoice_id, buyer_id, recipient_id, days, price_usd, price_stars,
+                          discount_percent, promo_code, status FROM premium_orders WHERE id = %s""",
+                (order_id,),
+            )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row
+        except Exception as e:
+            logger.error(f"Error getting premium order {order_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def mark_order_paid(self, order_id, provider_ref):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE premium_orders SET status = 'paid', provider_ref = %s, paid_at = %s WHERE id = %s",
+                (provider_ref, self._now_str(), order_id),
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error marking order {order_id} paid: {e}")
+            self.conn.rollback()
+
+    def has_paid_premium(self, user_id):
+        """Покупал ли игрок Premium раньше (себе или в подарок)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT 1 FROM premium_orders WHERE buyer_id = %s AND status = 'paid' LIMIT 1", (user_id,))
+            if self.cursor.fetchone():
+                self.conn.commit()
+                return True
+            self.cursor.execute(
+                "SELECT 1 FROM premium_transactions WHERE user_id = %s AND provider IN ('cryptobot', 'telegram_stars') LIMIT 1",
+                (user_id,),
+            )
+            found = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return found
+        except Exception as e:
+            logger.error(f"Error has_paid_premium {user_id}: {e}")
+            self.conn.rollback()
+            return True  # при ошибке скидку не даём
+
+    # ======================================================================
+    # FACEIT: автолобби 2x2 / 5x5, драфт капитанов, матчи и ELO
+    # ======================================================================
+    FC_LOBBY_COLS = (
+        "id, mode, team_size, map_name, status, captain_ct, captain_t, turn, turn_started_at, "
+        "host_id, topic_thread_id, winner, created_at, filled_at, finished_at"
+    )
+
+    def _migrate_faceit_tables(self):
+        """player_stats.rating = ELO. Добавляем победы/поражения и таблицы лобби/матчей."""
+        try:
+            self.cursor.execute("ALTER TABLE player_stats ADD COLUMN IF NOT EXISTS wins INTEGER DEFAULT 0")
+            self.cursor.execute("ALTER TABLE player_stats ADD COLUMN IF NOT EXISTS losses INTEGER DEFAULT 0")
+            self.cursor.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS device TEXT")
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fc_lobbies (
+                    id SERIAL PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    team_size INTEGER NOT NULL,
+                    map_name TEXT,
+                    status TEXT DEFAULT 'open',
+                    captain_ct BIGINT,
+                    captain_t BIGINT,
+                    turn TEXT,
+                    turn_started_at TEXT,
+                    host_id BIGINT,
+                    topic_thread_id INTEGER,
+                    winner TEXT,
+                    created_at TEXT,
+                    filled_at TEXT,
+                    finished_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fc_lobby_players (
+                    lobby_id INTEGER NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    team TEXT,
+                    is_captain BOOLEAN DEFAULT FALSE,
+                    joined_at TEXT,
+                    kills INTEGER DEFAULT 0,
+                    deaths INTEGER DEFAULT 0,
+                    elo_before INTEGER,
+                    elo_delta INTEGER,
+                    PRIMARY KEY (lobby_id, user_id)
+                )
+            ''')
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_fc_lp_user ON fc_lobby_players(user_id)")
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_fc_lobbies_status ON fc_lobbies(status)")
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Migration faceit tables failed: {e}")
+            self.conn.rollback()
+
+    # ---------- лобби ----------
+    def fc_create_lobby(self, mode, team_size, map_name):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "INSERT INTO fc_lobbies (mode, team_size, map_name, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
+                (mode, int(team_size), map_name, self._now_str()),
+            )
+            lobby_id = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return lobby_id
+        except Exception as e:
+            logger.error(f"Error creating fc lobby: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_get_lobby(self, lobby_id):
+        """(id, mode, team_size, map_name, status, captain_ct, captain_t, turn, turn_started_at,
+            host_id, topic_thread_id, winner, created_at, filled_at, finished_at) или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(f"SELECT {self.FC_LOBBY_COLS} FROM fc_lobbies WHERE id = %s", (lobby_id,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row
+        except Exception as e:
+            logger.error(f"Error getting fc lobby {lobby_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_get_open_lobby(self, mode):
+        """Открытое (набирающее игроков) лобби режима: (id, игроков) или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT l.id, (SELECT COUNT(*) FROM fc_lobby_players lp WHERE lp.lobby_id = l.id)
+                   FROM fc_lobbies l WHERE l.mode = %s AND l.status = 'open' ORDER BY l.id DESC LIMIT 1""",
+                (mode,),
+            )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row
+        except Exception as e:
+            logger.error(f"Error getting open fc lobby {mode}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_get_open_lobbies(self, mode):
+        """Все открытые лобби режима: [(id, map_name, игроков)] по возрастанию id."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT l.id, l.map_name, (SELECT COUNT(*) FROM fc_lobby_players lp WHERE lp.lobby_id = l.id)
+                   FROM fc_lobbies l WHERE l.mode = %s AND l.status = 'open' ORDER BY l.id ASC""",
+                (mode,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"Error getting open fc lobbies {mode}: {e}")
+            self.conn.rollback()
+            return []
+
+    def fc_get_user_active_lobby(self, user_id):
+        """id лобби/матча (open, draft или live), в котором сейчас игрок, либо None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT l.id FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
+                   WHERE lp.user_id = %s AND l.status IN ('open', 'draft', 'live')
+                   ORDER BY l.id DESC LIMIT 1""",
+                (user_id,),
+            )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error getting active fc lobby for {user_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_get_players(self, lobby_id):
+        """Игроки лобби: список словарей."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT lp.user_id, p.nickname, lp.team, lp.is_captain, COALESCE(s.rating, 0),
+                          COALESCE(s.kills, 0), COALESCE(s.deaths, 0), p.game_id, lp.kills, lp.deaths,
+                          lp.elo_before, lp.elo_delta, lp.joined_at, p.premium_until
+                   FROM fc_lobby_players lp
+                   JOIN players p ON p.user_id = lp.user_id
+                   LEFT JOIN player_stats s ON s.user_id = lp.user_id
+                   WHERE lp.lobby_id = %s ORDER BY lp.joined_at, lp.user_id""",
+                (lobby_id,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            now_s = self._now_str()
+            players = []
+            for r in rows:
+                players.append({
+                    "user_id": r[0], "nickname": r[1], "team": r[2], "is_captain": bool(r[3]), "elo": r[4] or 0,
+                    "total_kills": r[5] or 0, "total_deaths": r[6] or 0, "game_id": r[7],
+                    "kills": r[8] or 0, "deaths": r[9] or 0, "elo_before": r[10], "elo_delta": r[11],
+                    "joined_at": r[12], "premium": bool(r[13] and r[13] > now_s),
+                })
+            return players
+        except Exception as e:
+            logger.error(f"Error getting fc players {lobby_id}: {e}")
+            self.conn.rollback()
+            return []
+
+    def fc_join(self, lobby_id, user_id):
+        """Возвращает (ok, ошибка, игроков_теперь, вместимость)."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT status, team_size FROM fc_lobbies WHERE id = %s", (lobby_id,))
+            row = c.fetchone()
+            if not row or row[0] != "open":
+                self.conn.commit()
+                return False, "Это лобби уже недоступно.", 0, 0
+            capacity = row[1] * 2
+            c.execute(
+                """SELECT lp.lobby_id FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
+                   WHERE lp.user_id = %s AND l.status IN ('open', 'draft', 'live') LIMIT 1""",
+                (user_id,),
+            )
+            existing = c.fetchone()
+            if existing:
+                self.conn.commit()
+                if existing[0] == lobby_id:
+                    return False, "Вы уже в этом лобби.", 0, capacity
+                return False, "Вы уже участвуете в другом лобби или матче.", 0, capacity
+            c.execute("SELECT COUNT(*) FROM fc_lobby_players WHERE lobby_id = %s", (lobby_id,))
+            count = c.fetchone()[0]
+            if count >= capacity:
+                self.conn.commit()
+                return False, "Лобби уже заполнено.", count, capacity
+            c.execute(
+                "INSERT INTO fc_lobby_players (lobby_id, user_id, joined_at) VALUES (%s, %s, %s)",
+                (lobby_id, user_id, self._now_str()),
+            )
+            self.conn.commit()
+            return True, None, count + 1, capacity
+        except Exception as e:
+            logger.error(f"Error joining fc lobby {lobby_id}/{user_id}: {e}")
+            self.conn.rollback()
+            return False, "Ошибка базы данных, попробуйте позже.", 0, 0
+
+    def fc_leave(self, lobby_id, user_id):
+        """Выйти можно только пока лобби набирается."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """DELETE FROM fc_lobby_players WHERE lobby_id = %s AND user_id = %s
+                   AND EXISTS (SELECT 1 FROM fc_lobbies WHERE id = %s AND status = 'open')""",
+                (lobby_id, user_id, lobby_id),
+            )
+            removed = self.cursor.rowcount > 0
+            self.conn.commit()
+            return removed
+        except Exception as e:
+            logger.error(f"Error leaving fc lobby {lobby_id}/{user_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    # ---------- драфт ----------
+    def fc_set_draft(self, lobby_id, captain_ct, captain_t, first_turn):
+        """Лобби заполнено: назначаем капитанов и начинаем выбор игроков."""
+        try:
+            self.ensure_connection()
+            now_s = self._now_str()
+            self.cursor.execute(
+                """UPDATE fc_lobbies SET status = 'draft', captain_ct = %s, captain_t = %s, turn = %s,
+                          turn_started_at = %s, filled_at = %s WHERE id = %s AND status = 'open' RETURNING id""",
+                (captain_ct, captain_t, first_turn, now_s, now_s, lobby_id),
+            )
+            if self.cursor.fetchone() is None:
+                self.conn.rollback()
+                return False
+            self.cursor.execute(
+                "UPDATE fc_lobby_players SET team = 'ct', is_captain = TRUE WHERE lobby_id = %s AND user_id = %s",
+                (lobby_id, captain_ct),
+            )
+            self.cursor.execute(
+                "UPDATE fc_lobby_players SET team = 't', is_captain = TRUE WHERE lobby_id = %s AND user_id = %s",
+                (lobby_id, captain_t),
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error setting fc draft {lobby_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_pick(self, lobby_id, picker_id, target_id):
+        """Капитан выбирает игрока. Возвращает (ok, ошибка, осталось_невыбранных, команда_которой_передан_ход)."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT status, turn, captain_ct, captain_t FROM fc_lobbies WHERE id = %s", (lobby_id,))
+            row = c.fetchone()
+            if not row or row[0] != "draft":
+                self.conn.commit()
+                return False, "Выбор игроков уже завершён.", 0, None
+            status, turn, cap_ct, cap_t = row
+            picker_team = "ct" if picker_id == cap_ct else ("t" if picker_id == cap_t else None)
+            if picker_team is None:
+                self.conn.commit()
+                return False, "Выбирать игроков могут только капитаны.", 0, None
+            if picker_team != turn:
+                self.conn.commit()
+                return False, "Сейчас не ваш ход.", 0, None
+            c.execute("SELECT team FROM fc_lobby_players WHERE lobby_id = %s AND user_id = %s", (lobby_id, target_id))
+            target = c.fetchone()
+            if not target:
+                self.conn.commit()
+                return False, "Такого игрока нет в лобби.", 0, None
+            if target[0] is not None:
+                self.conn.commit()
+                return False, "Этот игрок уже выбран.", 0, None
+            c.execute(
+                "UPDATE fc_lobby_players SET team = %s WHERE lobby_id = %s AND user_id = %s",
+                (picker_team, lobby_id, target_id),
+            )
+            new_turn = "t" if turn == "ct" else "ct"
+            c.execute(
+                "UPDATE fc_lobbies SET turn = %s, turn_started_at = %s WHERE id = %s",
+                (new_turn, self._now_str(), lobby_id),
+            )
+            c.execute("SELECT COUNT(*) FROM fc_lobby_players WHERE lobby_id = %s AND team IS NULL", (lobby_id,))
+            remaining = c.fetchone()[0]
+            self.conn.commit()
+            return True, None, remaining, new_turn
+        except Exception as e:
+            logger.error(f"Error fc pick {lobby_id}: {e}")
+            self.conn.rollback()
+            return False, "Ошибка базы данных.", 0, None
+
+    def fc_assign_player(self, lobby_id, user_id, team):
+        """Принудительно ставит игрока в команду (последний оставшийся игрок)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE fc_lobby_players SET team = %s WHERE lobby_id = %s AND user_id = %s AND team IS NULL",
+                (team, lobby_id, user_id),
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error assigning fc player {lobby_id}/{user_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_get_draft_timeouts(self, seconds):
+        """Лобби в драфте, где ход идёт дольше seconds секунд: [lobby_id]."""
+        try:
+            self.ensure_connection()
+            cutoff = (datetime.now() - timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute(
+                "SELECT id FROM fc_lobbies WHERE status = 'draft' AND turn_started_at <= %s", (cutoff,)
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return [r[0] for r in rows]
+        except Exception as e:
+            logger.error(f"Error getting draft timeouts: {e}")
+            self.conn.rollback()
+            return []
+
+    # ---------- матч ----------
+    def fc_set_live(self, lobby_id, host_id, topic_thread_id=None):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE fc_lobbies SET status = 'live', host_id = %s, topic_thread_id = %s, turn = NULL WHERE id = %s AND status = 'draft' RETURNING id",
+                (host_id, topic_thread_id, lobby_id),
+            )
+            ok = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return ok
+        except Exception as e:
+            logger.error(f"Error setting fc live {lobby_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_set_topic(self, lobby_id, thread_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("UPDATE fc_lobbies SET topic_thread_id = %s WHERE id = %s", (thread_id, lobby_id))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error setting fc topic {lobby_id}: {e}")
+            self.conn.rollback()
+
+    def fc_get_lobby_by_thread(self, thread_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT id FROM fc_lobbies WHERE topic_thread_id = %s ORDER BY id DESC LIMIT 1", (thread_id,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error getting fc lobby by thread {thread_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_cancel(self, lobby_id):
+        """Отмена матча/лобби (кроме завершённых). True — отменили."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE fc_lobbies SET status = 'cancelled', finished_at = %s WHERE id = %s AND status IN ('open', 'draft', 'live') RETURNING id",
+                (self._now_str(), lobby_id),
+            )
+            ok = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return ok
+        except Exception as e:
+            logger.error(f"Error cancelling fc lobby {lobby_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_set_player_kd(self, lobby_id, user_id, kills, deaths):
+        """Записывает K/D игрока в матче. Если матч уже завершён, корректирует и общий K/D игрока."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute(
+                """SELECT lp.kills, lp.deaths, l.status FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
+                   WHERE lp.lobby_id = %s AND lp.user_id = %s""",
+                (lobby_id, user_id),
+            )
+            row = c.fetchone()
+            if not row:
+                self.conn.commit()
+                return False
+            old_k, old_d, status = row[0] or 0, row[1] or 0, row[2]
+            c.execute(
+                "UPDATE fc_lobby_players SET kills = %s, deaths = %s WHERE lobby_id = %s AND user_id = %s",
+                (kills, deaths, lobby_id, user_id),
+            )
+            if status == "finished":
+                c.execute(
+                    "UPDATE player_stats SET kills = GREATEST(0, kills + %s), deaths = GREATEST(0, deaths + %s) WHERE user_id = %s",
+                    (kills - old_k, deaths - old_d, user_id),
+                )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error setting fc kd {lobby_id}/{user_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_finish(self, lobby_id, winner, elo_win, elo_loss, premium_mult):
+        """Подводит итоги матча: ELO, победы/поражения, K/D. Возвращает список игроков с elo_delta или None."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT status FROM fc_lobbies WHERE id = %s", (lobby_id,))
+            row = c.fetchone()
+            self.conn.commit()
+            if not row or row[0] != "live":
+                return None
+        except Exception as e:
+            logger.error(f"Error finishing fc lobby {lobby_id}: {e}")
+            self.conn.rollback()
+            return None
+        players = self.fc_get_players(lobby_id)
+        try:
+            c = self.cursor
+            results = []
+            for p in players:
+                won = p["team"] == winner
+                if won:
+                    delta = int(round(elo_win * (premium_mult if p["premium"] else 1)))
+                else:
+                    delta = -int(elo_loss)
+                before = p["elo"]
+                after = max(0, before + delta)
+                real_delta = after - before
+                c.execute(
+                    """UPDATE player_stats SET rating = %s, matches_played = COALESCE(matches_played, 0) + 1,
+                              wins = COALESCE(wins, 0) + %s, losses = COALESCE(losses, 0) + %s,
+                              kills = COALESCE(kills, 0) + %s, deaths = COALESCE(deaths, 0) + %s
+                       WHERE user_id = %s""",
+                    (after, 1 if won else 0, 0 if won else 1, p["kills"], p["deaths"], p["user_id"]),
+                )
+                c.execute(
+                    "UPDATE fc_lobby_players SET elo_before = %s, elo_delta = %s WHERE lobby_id = %s AND user_id = %s",
+                    (before, real_delta, lobby_id, p["user_id"]),
+                )
+                results.append({**p, "won": won, "elo_before": before, "elo_after": after, "elo_delta": real_delta})
+            c.execute(
+                "UPDATE fc_lobbies SET status = 'finished', winner = %s, finished_at = %s WHERE id = %s",
+                (winner, self._now_str(), lobby_id),
+            )
+            self.conn.commit()
+            return results
+        except Exception as e:
+            logger.error(f"Error applying fc results {lobby_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    # ---------- история и статистика ----------
+    def fc_get_player_wl(self, user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT COALESCE(wins, 0), COALESCE(losses, 0) FROM player_stats WHERE user_id = %s", (user_id,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return (row[0], row[1]) if row else (0, 0)
+        except Exception as e:
+            logger.error(f"Error getting W/L for {user_id}: {e}")
+            self.conn.rollback()
+            return (0, 0)
+
+    def _fc_history_filter(self, user_id, mode, map_name, days):
+        where = ["lp.user_id = %s", "l.status = 'finished'"]
+        params = [user_id]
+        if mode:
+            where.append("l.mode = %s")
+            params.append(mode)
+        if map_name:
+            where.append("l.map_name = %s")
+            params.append(map_name)
+        if days:
+            where.append("l.finished_at >= %s")
+            params.append((datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S"))
+        return " AND ".join(where), params
+
+    def fc_history_count(self, user_id, mode=None, map_name=None, days=0):
+        try:
+            self.ensure_connection()
+            where, params = self._fc_history_filter(user_id, mode, map_name, days)
+            self.cursor.execute(
+                f"SELECT COUNT(*) FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id WHERE {where}",
+                tuple(params),
+            )
+            count = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return count
+        except Exception as e:
+            logger.error(f"Error counting fc history for {user_id}: {e}")
+            self.conn.rollback()
+            return 0
+
+    def fc_history(self, user_id, limit=5, offset=0, mode=None, map_name=None, days=0):
+        """[(lobby_id, mode, map_name, team, winner, elo_delta, kills, deaths, finished_at)] — новые сверху."""
+        try:
+            self.ensure_connection()
+            where, params = self._fc_history_filter(user_id, mode, map_name, days)
+            self.cursor.execute(
+                f"""SELECT l.id, l.mode, l.map_name, lp.team, l.winner, lp.elo_delta, lp.kills, lp.deaths, l.finished_at
+                    FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
+                    WHERE {where} ORDER BY l.id DESC LIMIT %s OFFSET %s""",
+                tuple(params) + (limit, offset),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"Error getting fc history for {user_id}: {e}")
+            self.conn.rollback()
+            return []
+
+    def fc_recent_results(self, user_id, limit=200):
+        """Результаты последних матчей игрока, новые первыми: [True (победа) / False (поражение)]."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT lp.team = l.winner FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
+                   WHERE lp.user_id = %s AND l.status = 'finished' ORDER BY l.id DESC LIMIT %s""",
+                (user_id, limit),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return [bool(r[0]) for r in rows]
+        except Exception as e:
+            logger.error(f"Error getting recent results for {user_id}: {e}")
+            self.conn.rollback()
+            return []
+
+    def fc_map_stats(self, user_id):
+        """[(карта, побед, матчей)] по картам игрока."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT l.map_name, SUM(CASE WHEN lp.team = l.winner THEN 1 ELSE 0 END), COUNT(*)
+                   FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
+                   WHERE lp.user_id = %s AND l.status = 'finished' GROUP BY l.map_name""",
+                (user_id,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return [(r[0], int(r[1] or 0), int(r[2])) for r in rows]
+        except Exception as e:
+            logger.error(f"Error getting map stats for {user_id}: {e}")
+            self.conn.rollback()
+            return []
+
+    # ---------- устройство игрока ----------
+    def fc_set_device(self, user_id, device):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("UPDATE players SET device = %s WHERE user_id = %s", (device, user_id))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error setting device for {user_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_get_device(self, user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT device FROM players WHERE user_id = %s", (user_id,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error getting device for {user_id}: {e}")
             self.conn.rollback()
             return None
 
@@ -869,6 +1875,39 @@ class Database:
             logger.error(f"Error creating lobby for user {creator_id}: {e}")
             self.conn.rollback()
             return None, None
+
+    def count_open_lobbies(self):
+        """Сколько лобби сейчас набирают игроков (статус active)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT COUNT(*) FROM lobbies WHERE status = 'active'")
+            count = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return count
+        except Exception as e:
+            logger.error(f"Error counting open lobbies: {e}")
+            self.conn.rollback()
+            return 0
+
+    def get_expired_empty_lobbies(self, minutes):
+        """Лобби старше N минут, где никого, кроме создателя, нет: [(lobby_id, lobby_unique_id, creator_id)]."""
+        try:
+            self.ensure_connection()
+            cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute(
+                """SELECT l.lobby_id, l.lobby_unique_id, l.creator_id
+                   FROM lobbies l
+                   WHERE l.status = 'active' AND l.created_at <= %s
+                     AND (SELECT COUNT(*) FROM lobby_players lp WHERE lp.lobby_id = l.lobby_id) <= 1""",
+                (cutoff,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"Error getting expired empty lobbies: {e}")
+            self.conn.rollback()
+            return []
 
     def get_active_lobbies(self):
         try:
@@ -1381,6 +2420,84 @@ class Database:
             return result[0] if result else 0
         except Exception as e:
             logger.error(f"Error getting lobby history count for user {user_id}: {e}")
+            return 0
+
+    def get_player_lobby_filter_options(self, user_id, field):
+        'Возвращает уникальные режимы или карты завершённых лобби игрока.'
+        if field not in ("mode", "map_name"):
+            return []
+        try:
+            self.ensure_connection()
+            self.cursor.execute(f'''
+                SELECT DISTINCT l.{field}
+                FROM lobbies l
+                JOIN lobby_players lp ON l.lobby_id = lp.lobby_id
+                WHERE lp.user_id = %s AND l.status = 'completed'
+                  AND l.{field} IS NOT NULL AND l.{field} <> ''
+                ORDER BY l.{field}
+            ''', (user_id,))
+            return [row[0] for row in self.cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting lobby history filter options ({field}) for user {user_id}: {e}")
+            return []
+
+    def get_filtered_player_lobby_history(self, user_id, mode=None, map_name=None, days=0, offset=0, limit=5):
+        'История завершённых лобби с необязательными фильтрами режима, карты и периода.'
+        try:
+            self.ensure_connection()
+            conditions = ["lp.user_id = %s", "l.status = 'completed'"]
+            params = [user_id, user_id]
+            if mode:
+                conditions.append("l.mode = %s")
+                params.append(mode)
+            if map_name:
+                conditions.append("l.map_name = %s")
+                params.append(map_name)
+            if days and int(days) in (7, 30, 90):
+                cutoff = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+                conditions.append("l.created_at >= %s")
+                params.append(cutoff)
+            params.extend([limit, offset])
+            self.cursor.execute(f'''
+                SELECT l.lobby_id, l.lobby_unique_id, l.mode, l.map_name, l.created_at,
+                       COALESCE(sh.kills_added, 0), COALESCE(sh.deaths_added, 0),
+                       COALESCE(sh.rating_added, 0), COALESCE(sh.created_at, l.created_at),
+                       CASE WHEN sh.history_id IS NOT NULL THEN true ELSE false END
+                FROM lobbies l
+                JOIN lobby_players lp ON l.lobby_id = lp.lobby_id
+                LEFT JOIN stats_history sh ON l.lobby_id = sh.lobby_id AND sh.user_id = %s
+                WHERE {" AND ".join(conditions)}
+                ORDER BY l.created_at DESC LIMIT %s OFFSET %s
+            ''', tuple(params))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error getting filtered lobby history for user {user_id}: {e}")
+            return []
+
+    def get_filtered_player_lobby_history_count(self, user_id, mode=None, map_name=None, days=0):
+        try:
+            self.ensure_connection()
+            conditions = ["lp.user_id = %s", "l.status = 'completed'"]
+            params = [user_id]
+            if mode:
+                conditions.append("l.mode = %s")
+                params.append(mode)
+            if map_name:
+                conditions.append("l.map_name = %s")
+                params.append(map_name)
+            if days and int(days) in (7, 30, 90):
+                cutoff = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+                conditions.append("l.created_at >= %s")
+                params.append(cutoff)
+            self.cursor.execute(f'''
+                SELECT COUNT(*) FROM lobbies l
+                JOIN lobby_players lp ON l.lobby_id = lp.lobby_id
+                WHERE {" AND ".join(conditions)}
+            ''', tuple(params))
+            result = self.cursor.fetchone()
+            return result[0] if result else 0
+        except Exception as e:
+            logger.error(f"Error counting filtered lobby history for user {user_id}: {e}")
             return 0
 
     def update_lobby_channel_message_id(self, lobby_id, message_id):
