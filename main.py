@@ -658,6 +658,7 @@ async def set_bot_commands_for_user(user_id):
     commands = [
         types.BotCommand(command="start", description="🎮 Главное меню"),
         types.BotCommand(command="profile", description="👤 Мой профиль"),
+        types.BotCommand(command="ticket", description="🎫 Тикет (жалоба / поддержка)"),
     ]
 
     if is_admin(user_id):
@@ -2229,6 +2230,8 @@ PICK_TIMEOUT_SEC = _env_int('PICK_TIMEOUT_SEC', 60)   # время капита�
 HOST_MODE = os.getenv('HOST_MODE', 'random').strip().lower()   # random — случайный игрок, captain — капитан
 CLOSE_TOPIC_AFTER_MATCH = os.getenv('CLOSE_TOPIC_AFTER_MATCH', 'true').strip().lower() in ('true', '1', 'yes', 'on')
 
+FC_COLORED_BUTTONS = os.getenv('FC_COLORED_BUTTONS', 'true').strip().lower() in ('true', '1', 'yes', 'on')
+_colored_state = {"on": FC_COLORED_BUTTONS}
 _topic_icon_cache = {}
 
 
@@ -2263,26 +2266,13 @@ def choose_captains(players):
     return ranked[0], ranked[1]
 
 
-def pick_map(mode, taken=()):
-    """Случайная карта: не такая же, как в соседних открытых лобби и в прошлом созданном."""
-    last = db.kv_get(f"fc_last_map:{mode}")
-    options = ([m for m in FC_MAPS if m != last and m not in taken]
-               or [m for m in FC_MAPS if m not in taken] or FC_MAPS)
-    chosen = random.choice(options)
-    db.kv_set(f"fc_last_map:{mode}", chosen)
-    return chosen
-
-
 async def ensure_open_lobbies():
-    """Всегда держим минимум FC_MIN_OPEN_LOBBIES (3) открытых лобби каждого режима, с разными картами."""
+    """Всегда держим минимум FC_MIN_OPEN_LOBBIES (3) открытых лобби каждого режима. Карту выбирают капитаны."""
     for mode, cfg in FC_MODES.items():
         open_lobbies = db.fc_get_open_lobbies(mode)
-        taken = [row[1] for row in open_lobbies]
         for _ in range(max(0, FC_MIN_OPEN_LOBBIES - len(open_lobbies))):
-            map_name = pick_map(mode, taken)
-            taken.append(map_name)
-            lobby_id = db.fc_create_lobby(mode, cfg["team_size"], map_name)
-            logger.info(f"Created open lobby {lobby_id} ({mode}, {map_name})")
+            lobby_id = db.fc_create_lobby(mode, cfg["team_size"], None)
+            logger.info(f"Created open lobby {lobby_id} ({mode})")
 
 
 def build_lobby_list(mode):
@@ -2291,13 +2281,14 @@ def build_lobby_list(mode):
     lobbies = db.fc_get_open_lobbies(mode)
     lines = [f"{pe('🎮')} <b>Режим {fc_title(mode)}</b> — выберите лобби", ""]
     rows = []
-    for lobby_id, map_name, count in lobbies:
-        lines.append(f"#{lobby_id} · {map_name} · {count}/{cap}")
-        rows.append([InlineKeyboardButton(text=f"#{lobby_id} · {map_name} · {count}/{cap}", callback_data=f"fcview_{lobby_id}")])
+    for lobby_id, _map_name, count in lobbies:
+        lines.append(f"Лобби #{lobby_id} · {count}/{cap}")
+        rows.append([InlineKeyboardButton(text=f"Лобби #{lobby_id} · {count}/{cap}", callback_data=f"fcview_{lobby_id}")])
     if not lobbies:
         lines.append("Лобби создаются, попробуйте через пару секунд.")
+    lines += ["", "Карту выберут капитаны после того, как соберут команды."]
     rows.append([btn("🔄 Обновить", callback_data=f"fclist_{mode}", icon="🔄")])
-    rows.append([btn("◀️ Назад", callback_data="back_to_main", icon="◀️")])
+    rows.append([btn("◀️ Назад", callback_data="fcfind", icon="◀️")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2311,6 +2302,26 @@ def elo_progress(elo):
 
 
 # ---------- отрисовка ----------
+def parse_bans(raw):
+    """'ct:Rust|t:Dune' -> [('ct', 'Rust'), ('t', 'Dune')]"""
+    result = []
+    for entry in (raw or "").split("|"):
+        if ":" in entry:
+            team, name = entry.split(":", 1)
+            result.append((team, name))
+    return result
+
+
+def map_button(lobby_id, index, name, banned):
+    """Кнопка карты: забаненная краснеет (стиль danger + 🔴) и не нажимается второй раз."""
+    if banned:
+        text = f"🔴 {name}"
+        if _colored_state["on"]:
+            return InlineKeyboardButton(text=text, callback_data=f"fcmapno_{lobby_id}", style="danger")
+        return InlineKeyboardButton(text=text, callback_data=f"fcmapno_{lobby_id}")
+    return InlineKeyboardButton(text=name, callback_data=f"fcban_{lobby_id}_{index}")
+
+
 def team_block(players, team, with_ids=False, mark_captain=True):
     lines = []
     for p in [x for x in players if x["team"] == team]:
@@ -2328,7 +2339,7 @@ def render_lobby(lobby_id, user_id):
     lobby = db.fc_get_lobby(lobby_id)
     if not lobby:
         return f"{pe('❌')} Лобби не найдено.", fc_back_keyboard()
-    (_, mode, team_size, map_name, status, cap_ct, cap_t, turn, _, host_id, _, winner, *_rest) = lobby
+    (_, mode, team_size, map_name, status, cap_ct, cap_t, turn, _, host_id, _, winner, _created, _filled, _finished, veto_banned) = lobby
     players = db.fc_get_players(lobby_id)
     capacity = team_size * 2
     me = next((p for p in players if p["user_id"] == user_id), None)
@@ -2337,7 +2348,6 @@ def render_lobby(lobby_id, user_id):
     if status == "open":
         lines = [
             f"{pe('🎮')} <b>Лобби {title} #{lobby_id}</b>",
-            f"{pe('🗺')} Карта: {map_name}",
             f"{pe('👥')} Игроков: {len(players)}/{capacity}",
             "",
         ]
@@ -2345,7 +2355,7 @@ def render_lobby(lobby_id, user_id):
             lines.append(f"{i}. {get_player_level(p['elo'])} {display_nickname(p['user_id'], p['nickname'])} — {p['elo']} ELO")
         for i in range(len(players) + 1, capacity + 1):
             lines.append(f"{i}. —")
-        lines += ["", "После заполнения лобби капитаны по очереди выберут игроков в команды."]
+        lines += ["", "После заполнения лобби капитаны по очереди выберут игроков в команды, а затем забанят карты."]
         if me:
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [btn("🚪 Выйти из лобби", callback_data=f"fcleave_{lobby_id}", icon="🚪")],
@@ -2365,7 +2375,6 @@ def render_lobby(lobby_id, user_id):
         free = [p for p in players if p["team"] is None]
         lines = [
             f"{pe('🏁')} <b>Матч #{lobby_id} — выбор игроков</b>",
-            f"{pe('🗺')} Карта: {map_name}",
             "",
             FC_SIDES["ct"],
             *(team_block(players, "ct") or ["—"]),
@@ -2385,6 +2394,38 @@ def render_lobby(lobby_id, user_id):
                 text=f"{p['nickname']} · K/D {player_kd(p):.2f}",
                 callback_data=f"fcpick_{lobby_id}_{p['user_id']}",
             ))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([btn("🔄 Обновить", callback_data=f"fcview_{lobby_id}", icon="🔄")])
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if status == "veto":
+        bans = parse_bans(veto_banned)
+        banned_names = [name for _, name in bans]
+        turn_cap = next((p for p in players if p["user_id"] == (cap_ct if turn == "ct" else cap_t)), None) if turn else None
+        lines = [
+            f"{pe('🗺')} <b>Матч #{lobby_id} — бан карт</b>",
+            "",
+            f"{FC_SIDES['ct']}: " + (", ".join(p['nickname'] for p in players if p['team'] == 'ct') or "—"),
+            f"{FC_SIDES['t']}: " + (", ".join(p['nickname'] for p in players if p['team'] == 't') or "—"),
+            "",
+            "Капитаны по очереди банят карты. Последняя оставшаяся карта будет сыграна.",
+        ]
+        if turn_cap:
+            lines.append(f"\n{pe('⏳')} Банит: <b>{display_nickname(turn_cap['user_id'], turn_cap['nickname'])}</b> ({FC_SIDES[turn]})")
+        lines.append(f"Забанено: {len(bans)} из {len(FC_MAPS) - 1}  ·  на ход даётся {PICK_TIMEOUT_SEC} сек.")
+        if len(bans) == len(FC_MAPS) - 2:
+            lines.append(f"{pe('⚠️')} Осталось две карты: та, которую вы забаните, играться НЕ будет — сыграют оставшуюся.")
+        if bans:
+            lines.append("Баны: " + " · ".join(f"{i}. {name} ({FC_SIDES.get(team, '')})" for i, (team, name) in enumerate(bans, 1)))
+        if me and me["is_captain"] and turn_cap and turn_cap["user_id"] == user_id:
+            lines.append(f"\n{pe('👉')} <b>Ваш ход — нажмите на карту, которую хотите забанить:</b>")
+        rows, row = [], []
+        for i, name in enumerate(FC_MAPS):
+            row.append(map_button(lobby_id, i, name, name in banned_names))
             if len(row) == 2:
                 rows.append(row)
                 row = []
@@ -2418,9 +2459,7 @@ def render_lobby(lobby_id, user_id):
     return f"{pe('❌')} Матч #{lobby_id} отменён.", fc_back_keyboard()
 
 
-async def push_lobby_view(lobby_id, user_id, force_new=False):
-    """Обновляет (или отправляет) игроку единственное сообщение с лобби/матчем."""
-    text, kb = render_lobby(lobby_id, user_id)
+async def _push_once(user_id, text, kb, force_new):
     message_id = None if force_new else db.kv_get(f"fcmsg:{user_id}")
     if message_id:
         try:
@@ -2441,6 +2480,21 @@ async def push_lobby_view(lobby_id, user_id, force_new=False):
         return False
 
 
+async def push_lobby_view(lobby_id, user_id, force_new=False):
+    """Обновляет (или отправляет) игроку единственное сообщение с лобби/матчем."""
+    text, kb = render_lobby(lobby_id, user_id)
+    ok_sent = await _push_once(user_id, text, kb, force_new)
+    if not ok_sent and _colored_state["on"]:
+        lobby = db.fc_get_lobby(lobby_id)
+        if lobby and lobby[4] == "veto":
+            # возможно, клиент/Телеграм не принял цветные кнопки: отключаем их и пробуем ещё раз
+            _colored_state["on"] = False
+            logger.warning("Coloured buttons rejected, switching to plain buttons (🔴 emoji only)")
+            text, kb = render_lobby(lobby_id, user_id)
+            ok_sent = await _push_once(user_id, text, kb, force_new)
+    return ok_sent
+
+
 async def refresh_lobby_for_all(lobby_id, force_new=False):
     for p in db.fc_get_players(lobby_id):
         await push_lobby_view(lobby_id, p["user_id"], force_new=force_new)
@@ -2457,6 +2511,32 @@ async def open_lobby_for_user(user_id, lobby_id):
 
 
 # ---------- вход в лобби ----------
+@dp.callback_query(lambda c: c.data == "fcfind")
+async def fc_find(callback_query: types.CallbackQuery):
+    """«Найти матч»: выбор режима 2 на 2 / 5 на 5 (или возврат в текущее лобби/матч)."""
+    user_id = callback_query.from_user.id
+    if not db.is_user_registered(user_id):
+        await callback_query.answer("❌ Сначала зарегистрируйтесь.", show_alert=True)
+        return
+    active = db.fc_get_user_active_lobby(user_id)
+    if active:
+        await open_lobby_for_user(user_id, active)
+        await callback_query.answer()
+        return
+    await ensure_open_lobbies()
+    await cleanup_user_messages(user_id)
+    waiting = {mode: sum(row[2] for row in db.fc_get_open_lobbies(mode)) for mode in FC_MODES}
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            btn(f"2 на 2 · в очереди: {waiting['2x2']}", callback_data="fcmode_2x2", icon="🎮"),
+            btn(f"5 на 5 · в очереди: {waiting['5x5']}", callback_data="fcmode_5x5", icon="🎮"),
+        ],
+        [btn("◀️ Назад", callback_data="back_to_main", icon="◀️")],
+    ])
+    await send_message_with_image(user_id, f"{pe('🎮')} <b>Найти матч</b>\n\nВыберите режим:", None, kb)
+    await callback_query.answer()
+
+
 @dp.callback_query(lambda c: c.data.startswith("fcmode_"))
 async def fc_mode(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
@@ -2541,7 +2621,6 @@ async def fc_join_confirm(callback_query: types.CallbackQuery):
     text = (
         f"{pe('❓')} <b>Подтвердите вход в лобби</b>\n\n"
         f"{pe('🎮')} Режим: {fc_title(lobby[1])}\n"
-        f"{pe('🗺')} Карта: {lobby[3]}\n"
         f"{pe('👥')} Игроков сейчас: {count}/{lobby[2] * 2}\n\n"
         f"После входа вы не сможете присоединиться к другому лобби, пока не выйдете или не закончится матч."
     )
@@ -2613,6 +2692,7 @@ async def start_draft(lobby_id):
     first_turn = "ct" if weak["user_id"] == ct["user_id"] else "t"   # слабейший капитан выбирает первым
     if not db.fc_set_draft(lobby_id, ct["user_id"], t["user_id"], first_turn):
         return
+    db.kv_set(f"fc_firstpick:{lobby_id}", first_turn)
     await ensure_open_lobbies()                  # освободили очередь: сразу появилось новое лобби
     await refresh_lobby_for_all(lobby_id)
     for p, side in ((ct, "ct"), (t, "t")):
@@ -2643,7 +2723,7 @@ async def after_pick(lobby_id, remaining, next_turn):
             db.fc_assign_player(lobby_id, free[0]["user_id"], next_turn)
             remaining = 0
     if remaining == 0:
-        await finish_draft(lobby_id)
+        await start_veto(lobby_id)
     else:
         await refresh_lobby_for_all(lobby_id)
 
@@ -2746,8 +2826,70 @@ async def create_match_topic(lobby_id):
         return None
 
 
-async def finish_draft(lobby_id):
-    """Команды собраны: выбираем хоста, создаём тему у модераторов, запускаем матч."""
+async def start_veto(lobby_id):
+    """Игроки выбраны: капитаны банят карты. Первым банит тот, кто выбирал игроков вторым."""
+    first_pick = db.kv_get(f"fc_firstpick:{lobby_id}") or "ct"
+    first_ban = "t" if first_pick == "ct" else "ct"
+    if not db.fc_start_veto(lobby_id, first_ban):
+        return
+    await refresh_lobby_for_all(lobby_id)
+    lobby = db.fc_get_lobby(lobby_id)
+    for captain_id, side in ((lobby[5], "ct"), (lobby[6], "t")):
+        try:
+            text = (f"{pe('🗺')} Команды собраны! Начинается бан карт — "
+                    + ("ваш ход, вы баните первым." if side == first_ban else "вторым банит ваш соперник."))
+            await bot.send_message(chat_id=captain_id, text=text, parse_mode='HTML')
+        except Exception as e:
+            logger.info(f"Cannot notify captain {captain_id} about veto: {e}")
+
+
+@dp.callback_query(lambda c: c.data.startswith("fcban_"))
+async def fc_ban(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    try:
+        _, lobby_s, idx_s = callback_query.data.split("_")
+        lobby_id, index = int(lobby_s), int(idx_s)
+        map_name = FC_MAPS[index]
+    except (ValueError, IndexError):
+        await callback_query.answer()
+        return
+    ok_ban, error, _remaining, _next_turn, final_map = db.fc_ban_map(lobby_id, user_id, map_name, FC_MAPS)
+    if not ok_ban:
+        await callback_query.answer(f"❌ {error}", show_alert=True)
+        return
+    await callback_query.answer(f"🔴 Забанена: {map_name}")
+    await after_ban(lobby_id, final_map)
+
+
+@dp.callback_query(lambda c: c.data.startswith("fcmapno_"))
+async def fc_map_already_banned(callback_query: types.CallbackQuery):
+    await callback_query.answer("🔴 Эта карта уже забанена.", show_alert=True)
+
+
+async def after_ban(lobby_id, final_map):
+    if final_map:
+        await finish_veto(lobby_id)
+    else:
+        await refresh_lobby_for_all(lobby_id)
+
+
+async def auto_ban(lobby_id):
+    """Капитан не успел забанить карту — бот банит случайную из оставшихся."""
+    lobby = db.fc_get_lobby(lobby_id)
+    if not lobby or lobby[4] != "veto" or not lobby[7]:
+        return
+    banned = {name for _, name in parse_bans(lobby[15])}
+    available = [m for m in FC_MAPS if m not in banned]
+    if len(available) < 2:
+        return
+    captain_id = lobby[5] if lobby[7] == "ct" else lobby[6]
+    ok_ban, _, _, _, final_map = db.fc_ban_map(lobby_id, captain_id, random.choice(available), FC_MAPS)
+    if ok_ban:
+        await after_ban(lobby_id, final_map)
+
+
+async def finish_veto(lobby_id):
+    """Карта определена: выбираем хоста, создаём тему у модераторов, запускаем матч."""
     players = db.fc_get_players(lobby_id)
     lobby = db.fc_get_lobby(lobby_id)
     if not players or not lobby:
@@ -2762,11 +2904,12 @@ async def finish_draft(lobby_id):
     if thread_id:
         db.fc_set_topic(lobby_id, thread_id)
     await refresh_lobby_for_all(lobby_id)
+    map_name = db.fc_get_lobby(lobby_id)[3]
     for p in players:
         try:
             await bot.send_message(
                 chat_id=p["user_id"],
-                text=f"{pe('🎮')} Матч #{lobby_id} начался! Карта, ваша сторона и хост — в сообщении с лобби выше.",
+                text=f"{pe('🎮')} Матч #{lobby_id} начался! Карта: {map_name}. Сторона и хост — в сообщении с лобби выше.",
                 parse_mode='HTML',
             )
         except Exception as e:
@@ -3084,8 +3227,11 @@ async def fc_background_loop():
     while True:
         try:
             await ensure_open_lobbies()
-            for lobby_id in db.fc_get_draft_timeouts(PICK_TIMEOUT_SEC):
-                await auto_pick(lobby_id)
+            for lobby_id, status in db.fc_get_turn_timeouts(PICK_TIMEOUT_SEC):
+                if status == "draft":
+                    await auto_pick(lobby_id)
+                else:
+                    await auto_ban(lobby_id)
         except Exception as e:
             logger.error(f"Error in fc_background_loop: {e}")
         await asyncio.sleep(5)
@@ -3314,6 +3460,287 @@ async def _show_filtered_lobby_history(user_id, mode_idx, map_idx, days, offset)
     kb_rows.append([btn("◀️ К истории", callback_data="lobby_history", icon="◀️")])
     await cleanup_user_messages(user_id)
     await send_message_with_image(user_id, text, None, InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+# ======================================================================
+# ТИКЕТЫ (поддержка): жалоба на игрока по матчу → тема в группе модераторов
+# ======================================================================
+TICKET_DAILY_LIMIT = _env_int('TICKET_DAILY_LIMIT', 3)     # сколько тикетов может подать игрок за сутки
+TICKET_REASON_MIN = 5
+TICKET_REASON_MAX = 500                                     # подпись к фото в Телеграме ограничена 1024 символами
+
+
+class TicketStates(StatesGroup):
+    waiting_for_reason = State()
+    waiting_for_accused = State()
+    waiting_for_screenshot = State()
+
+
+def ticket_cancel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="ticket_cancel", icon="❌")]])
+
+
+def ticket_number(ticket_id):
+    return f"{ticket_id:05d}"
+
+
+async def begin_ticket(user_id, state):
+    """Шаг 1: выбор матча из последних трёх."""
+    await state.clear()
+    await cleanup_user_messages(user_id)
+    if not db.is_user_registered(user_id):
+        await send_message_with_image(user_id, f"{pe('❌')} Сначала зарегистрируйтесь через /start.", None, fc_back_keyboard())
+        return
+    if db.fc_count_recent_tickets(user_id) >= TICKET_DAILY_LIMIT:
+        await send_message_with_image(
+            user_id, f"{pe('❌')} Лимит тикетов на сегодня исчерпан ({TICKET_DAILY_LIMIT}). Попробуйте завтра.", None, fc_back_keyboard()
+        )
+        return
+    matches = db.fc_recent_matches(user_id, 3)
+    if not matches:
+        await send_message_with_image(
+            user_id, f"{pe('❌')} У вас пока нет матчей, по которым можно подать тикет.", None, fc_back_keyboard()
+        )
+        return
+    rows = [
+        [InlineKeyboardButton(text=f"#{lobby_id} · {fc_title(mode)} · {map_name or '—'}", callback_data=f"ticket_m_{lobby_id}")]
+        for lobby_id, mode, map_name, _status, _finished in matches
+    ]
+    rows.append([btn("❌ Отмена", callback_data="ticket_cancel", icon="❌")])
+    text = (
+        f"{pe('🎫')} <b>Тикет · шаг 1 из 4</b>\n\n"
+        f"Выберите матч, в котором произошло нарушение (последние три):"
+    )
+    await send_message_with_image(user_id, text, None, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.message(Command("ticket"))
+async def cmd_ticket(message: types.Message, state: FSMContext):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await begin_ticket(message.from_user.id, state)
+
+
+@dp.callback_query(lambda c: c.data == "ticket_start")
+async def ticket_start(callback_query: types.CallbackQuery, state: FSMContext):
+    await begin_ticket(callback_query.from_user.id, state)
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data == "ticket_cancel")
+async def ticket_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_id = callback_query.from_user.id
+    await cleanup_user_messages(user_id)
+    await send_message_with_image(user_id, f"{pe('👋')} Тикет отменён.\n\nВыберите действие:", MENU_IMAGE_URL, get_main_keyboard(user_id))
+    await callback_query.answer("Отменено")
+
+
+@dp.callback_query(lambda c: c.data.startswith("ticket_m_"))
+async def ticket_pick_match(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    try:
+        lobby_id = int(callback_query.data.replace("ticket_m_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    if lobby_id not in [m[0] for m in db.fc_recent_matches(user_id, 3)]:
+        await callback_query.answer("Этот матч недоступен для тикета.", show_alert=True)
+        return
+    await state.set_state(TicketStates.waiting_for_reason)
+    await state.update_data(ticket_lobby=lobby_id)
+    await cleanup_user_messages(user_id)
+    text = (
+        f"{pe('🎫')} <b>Тикет · шаг 2 из 4</b>\n\n"
+        f"Матч #{lobby_id}.\n"
+        f"Опишите суть нарушения своими словами (от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов):"
+    )
+    await send_message_with_image(user_id, text, None, ticket_cancel_keyboard())
+    await callback_query.answer()
+
+
+@dp.message(TicketStates.waiting_for_reason)
+async def ticket_reason(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    reason = (message.text or "").strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if len(reason) < TICKET_REASON_MIN or len(reason) > TICKET_REASON_MAX:
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"❌ Опишите нарушение текстом от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов (сейчас {len(reason)}).",
+            reply_markup=ticket_cancel_keyboard(),
+        )
+        return
+    data = await state.get_data()
+    await state.update_data(ticket_reason=reason)
+    await state.set_state(TicketStates.waiting_for_accused)
+    players = [p["nickname"] for p in db.fc_get_players(data["ticket_lobby"]) if p["user_id"] != user_id]
+    await cleanup_user_messages(user_id)
+    text = (
+        f"{pe('🎫')} <b>Тикет · шаг 3 из 4</b>\n\n"
+        f"Введите никнейм игрока, на которого вы подаёте жалобу.\n"
+        f"Игроки матча: {', '.join(esc(n) for n in players)}"
+    )
+    await send_message_with_image(user_id, text, None, ticket_cancel_keyboard())
+
+
+@dp.message(TicketStates.waiting_for_accused)
+async def ticket_accused(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    nickname = (message.text or "").strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    players = db.fc_get_players(data["ticket_lobby"])
+    accused = next((p for p in players if p["nickname"].lower() == nickname.lower() and p["user_id"] != user_id), None)
+    if not accused:
+        names = ", ".join(esc(p["nickname"]) for p in players if p["user_id"] != user_id)
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"❌ Игрока «{nickname[:30]}» нет в этом матче. Игроки матча: {names}",
+            reply_markup=ticket_cancel_keyboard(),
+        )
+        return
+    await state.update_data(ticket_accused=accused["user_id"])
+    await state.set_state(TicketStates.waiting_for_screenshot)
+    await cleanup_user_messages(user_id)
+    text = (
+        f"{pe('🎫')} <b>Тикет · шаг 4 из 4</b>\n\n"
+        f"Отправьте скриншот нарушения <b>одним фото</b> (как фото, а не файлом)."
+    )
+    await send_message_with_image(user_id, text, None, ticket_cancel_keyboard())
+
+
+def ticket_keyboard(ticket_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        btn("✅ Принят", callback_data=f"tk_ok_{ticket_id}", icon="✅"),
+        btn("❌ Отклонён", callback_data=f"tk_no_{ticket_id}", icon="❌"),
+    ]])
+
+
+def build_ticket_caption(ticket_id, lobby, reporter_nick, accused_nick, reason):
+    return (
+        f"{pe('📥')} Новый тикет #{ticket_number(ticket_id)}\n\n"
+        f"{pe('🗺')} Карта: {lobby[3] or '—'}\n"
+        f"{pe('🎮')} Режим: {fc_title(lobby[1])}\n"
+        f"🆔 Матч: #{lobby[0]}\n"
+        f"{pe('👤')} Никнейм подавшего: {esc(reporter_nick)}\n"
+        f"{pe('👤')} Никнейм на которого подается жалоба: {esc(accused_nick)}\n\n"
+        f"{pe('⛔️')} Суть жалобы: {esc(reason)}\n\n"
+        f"{pe('🖼')} Доказательства приложены в виде скриншота."
+    )
+
+
+@dp.message(TicketStates.waiting_for_screenshot)
+async def ticket_screenshot(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if not message.photo:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await bot.send_message(
+            chat_id=user_id, text="❌ Нужен скриншот именно фотографией. Отправьте одно фото.", reply_markup=ticket_cancel_keyboard()
+        )
+        return
+    data = await state.get_data()
+    lobby_id, accused_id, reason = data.get("ticket_lobby"), data.get("ticket_accused"), data.get("ticket_reason")
+    lobby = db.fc_get_lobby(lobby_id) if lobby_id else None
+    if not lobby or not accused_id or not reason:
+        await state.clear()
+        await message.answer("Данные тикета потерялись, начните заново: /ticket")
+        return
+    if not MODERATOR_GROUP_ID:
+        await state.clear()
+        await message.answer("❌ Приём тикетов сейчас недоступен. Напишите администратору.")
+        return
+    file_id = message.photo[-1].file_id
+    ticket_id = db.fc_create_ticket(user_id, accused_id, lobby_id, reason, file_id)
+    if not ticket_id:
+        await message.answer("❌ Не удалось сохранить тикет, попробуйте позже.")
+        return
+    reporter = db.get_player_profile(user_id)
+    accused = db.get_player_profile(accused_id)
+    reporter_nick = reporter[2] if reporter else str(user_id)
+    accused_nick = accused[2] if accused else str(accused_id)
+    try:
+        topic = await bot.create_forum_topic(chat_id=int(MODERATOR_GROUP_ID), name=f"🎫 Тикет #{ticket_number(ticket_id)}")
+        thread_id = topic.message_thread_id
+        await bot.send_photo(
+            chat_id=int(MODERATOR_GROUP_ID), message_thread_id=thread_id, photo=file_id,
+            caption=build_ticket_caption(ticket_id, lobby, reporter_nick, accused_nick, reason),
+            parse_mode='HTML', reply_markup=ticket_keyboard(ticket_id),
+        )
+        db.fc_set_ticket_thread(ticket_id, thread_id)
+    except Exception as e:
+        logger.error(f"Cannot deliver ticket {ticket_id} to moderators: {e}")
+        db.fc_resolve_ticket(ticket_id, "failed", 0)
+        await state.clear()
+        await message.answer("❌ Не удалось отправить тикет модераторам. Попробуйте ещё раз: /ticket")
+        return
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await cleanup_user_messages(user_id)
+    await send_message_with_image(
+        user_id,
+        f"{pe('✅')} Тикет #{ticket_number(ticket_id)} отправлен модераторам. Мы сообщим о решении.",
+        MENU_IMAGE_URL, get_main_keyboard(user_id),
+    )
+
+
+@dp.callback_query(lambda c: c.data.startswith("tk_ok_") or c.data.startswith("tk_no_"))
+async def ticket_resolve(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("Только для администраторов.", show_alert=True)
+        return
+    accepted = callback_query.data.startswith("tk_ok_")
+    try:
+        ticket_id = int(callback_query.data.split("_")[2])
+    except (ValueError, IndexError):
+        await callback_query.answer()
+        return
+    ticket = db.fc_get_ticket(ticket_id)
+    if not ticket:
+        await callback_query.answer("Тикет не найден.", show_alert=True)
+        return
+    if not db.fc_resolve_ticket(ticket_id, "resolved" if accepted else "rejected", callback_query.from_user.id):
+        await callback_query.answer("Тикет уже обработан.", show_alert=True)
+        return
+    db.log_admin_action(callback_query.from_user.id, "ticket_resolved" if accepted else "ticket_rejected", ticket[2], f"ticket #{ticket_number(ticket_id)}")
+    verdict = "✅ Принят" if accepted else "❌ Отклонён"
+    try:
+        base = callback_query.message.html_text if getattr(callback_query.message, "html_text", None) else (callback_query.message.caption or "")
+        await callback_query.message.edit_caption(
+            caption=f"{base}\n\n{verdict} — {esc(callback_query.from_user.full_name)}", parse_mode='HTML', reply_markup=None
+        )
+    except Exception as e:
+        logger.warning(f"Cannot edit ticket caption: {e}")
+    try:
+        await bot.send_message(
+            chat_id=ticket[1],
+            text=(f"{pe('✅')} Ваш тикет #{ticket_number(ticket_id)} рассмотрен: нарушение подтверждено, меры приняты."
+                  if accepted else
+                  f"{pe('❌')} Ваш тикет #{ticket_number(ticket_id)} рассмотрен и отклонён: нарушений не найдено."),
+            parse_mode='HTML',
+        )
+    except Exception as e:
+        logger.info(f"Cannot notify reporter {ticket[1]}: {e}")
+    if MODERATOR_GROUP_ID and ticket[7]:
+        try:
+            await bot.close_forum_topic(chat_id=int(MODERATOR_GROUP_ID), message_thread_id=ticket[7])
+        except Exception as e:
+            logger.info(f"Cannot close ticket topic: {e}")
+    await callback_query.answer("Готово")
 
 
 # ======================================================================
@@ -3557,68 +3984,32 @@ async def cancel_registration(callback_query: types.CallbackQuery, state: FSMCon
 
 
 # ---------- профиль ----------
-def compute_streaks(results):
-    """results — новые первыми (True = победа). Возвращает (текущая серия побед, лучшая серия)."""
-    current = 0
-    for r in results:
-        if r:
-            current += 1
-        else:
-            break
-    best = run = 0
-    for r in reversed(results):
-        run = run + 1 if r else 0
-        best = max(best, run)
-    return current, best
-
-
-def best_map_line(user_id):
-    """Лучшая карта по винрейту (минимум 3 матча на карте)."""
-    stats = [(m, w, t) for m, w, t in db.fc_map_stats(user_id) if t >= 3]
-    if not stats:
-        return None
-    name, wins, total = max(stats, key=lambda x: (x[1] / x[2], x[2]))
-    return f"• Лучшая карта: {name} — {wins / total * 100:.0f}% побед ({total} матч.)"
-
-
 def build_profile_text(user_id):
     p = db.get_player_profile(user_id)
     if not p:
         return None
     _, _, nickname, game_id, _, rating, matches, kills, deaths, _, _, premium_until = p
-    elo, matches, kills, deaths = rating or 0, matches or 0, kills or 0, deaths or 0
+    elo, kills, deaths = rating or 0, kills or 0, deaths or 0
     wins, losses = db.fc_get_player_wl(user_id)
     winrate = f"{wins / (wins + losses) * 100:.0f}%" if (wins + losses) else "—"
     lines = [
-        f"{pe('👤')} <b>Ваш профиль</b> | {display_nickname(user_id, nickname)}",
-        f"🆔 Игровой ID: <code>{esc(game_id)}</code>",
+        f"{pe('👤')} <b>{display_nickname(user_id, nickname)}</b>",
+        f"🆔 ID: <code>{esc(game_id)}</code>",
         f"🕹 Устройство: {DEVICE_LABELS.get(db.fc_get_device(user_id), 'не указано')}",
         "",
-        f"{pe('📈')} Уровень: {get_player_level(elo)}",
-        f"{pe('🏆')} ELO: <b>{elo}</b>",
+        f"{pe('📈')} Уровень: {get_player_level(elo)} · {elo} ELO",
     ]
     nxt = elo_progress(elo)
     if nxt:
-        lines.append(f"До уровня {nxt[0]}: {nxt[1]} ELO")
+        lines.append(f"🎯 До уровня {nxt[0]}: {nxt[1]} ELO")
+    if premium_until and db.is_premium(user_id):
+        lines.append(f"{pe('⭐️')} Premium: {db.get_premium_days_left(user_id)} дн.")
     lines += [
         "",
-        f"{pe('📊')} <b>Статистика</b>",
-        f"• Матчей: {matches}",
-        f"• Победы / поражения: {wins} / {losses} (винрейт {winrate})",
-        f"• Убийства / смерти: {kills} / {deaths} (K/D {kd_value(kills, deaths):.2f})",
+        f"{pe('📊')} K/D: {kd_value(kills, deaths):.2f}",
+        f"🔫 Убийства: {kills} · 💀 Смерти: {deaths}",
+        f"{pe('🏆')} Винрейт: {winrate}",
     ]
-    results = db.fc_recent_results(user_id)
-    if results:
-        current, best = compute_streaks(results)
-        form = "".join(pe("✅") if r else pe("❌") for r in results[:5])
-        lines.append(f"• Форма (последние {min(5, len(results))}): {form}")
-        lines.append(f"• Серия побед: {current} (рекорд {best})")
-    best_map = best_map_line(user_id)
-    if best_map:
-        lines.append(best_map)
-    if premium_until and db.is_premium(user_id):
-        days = db.get_premium_days_left(user_id)
-        lines += ["", f"{pe('⭐️')} Premium: осталось {days} дн. (×1.5 ELO за победу)"]
     return "\n".join(lines)
 
 
@@ -3692,25 +4083,22 @@ async def show_all_time_top(callback_query: types.CallbackQuery):
 
 # ---------- главное меню и /start ----------
 def get_main_keyboard(user_id=None):
-    def mode_label(mode):
-        title = fc_title(mode)
-        waiting = sum(row[2] for row in db.fc_get_open_lobbies(mode))
-        return f"🎮 {title} · в очереди: {waiting}"
-
-    keyboard = [
-        [btn("👤 Мой профиль", callback_data="profile", icon="👤")],
+    """Главное меню: большая «Найти матч», в два столбца «Профиль» и «Топ», затем большие Premium, «Промокод» и «Тикет»."""
+    in_match = bool(user_id and db.fc_get_user_active_lobby(user_id))
+    find_button = (
+        btn("📋 Мой матч / лобби", callback_data="fcfind", icon="📋")
+        if in_match else btn("🔍 Найти матч", callback_data="fcfind", icon="🔍")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [find_button],
         [
-            btn(mode_label("2x2"), callback_data="fcmode_2x2", icon="🎮"),
-            btn(mode_label("5x5"), callback_data="fcmode_5x5", icon="🎮"),
+            btn("👤 Мой профиль", callback_data="profile", icon="👤"),
+            btn("🏆 Топ игроков", callback_data="top", icon="🏆"),
         ],
-    ]
-    if user_id and db.fc_get_user_active_lobby(user_id):
-        keyboard.append([btn("📋 Моё лобби / матч", callback_data="fcmine", icon="📋")])
-    keyboard += [
-        [btn("⭐️ Premium", callback_data="premium_menu", icon="⭐️"), btn("🏆 Топ", callback_data="top", icon="🏆")],
-        [btn("🕗 История матчей", callback_data="lobby_history", icon="🕗"), btn("🎟 Промокод", callback_data="promo_enter", icon="🎟")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+        [btn("⭐️ Premium", callback_data="premium_menu", icon="⭐️")],
+        [btn("🎟 Промокод", callback_data="promo_enter", icon="🎟")],
+        [btn("🎫 Тикет", callback_data="ticket_start", icon="🎫")],
+    ])
 
 
 @dp.message(Command("start"))
@@ -3750,6 +4138,7 @@ async def main():
     commands = [
         types.BotCommand(command="start", description="🎮 Главное меню"),
         types.BotCommand(command="profile", description="👤 Мой профиль"),
+        types.BotCommand(command="ticket", description="🎫 Тикет (жалоба / поддержка)"),
     ]
     try:
         await bot.set_my_commands(commands)

@@ -371,7 +371,7 @@ class Database:
                 "players_24h": one("SELECT COUNT(*) FROM players WHERE registration_date >= %s", (day_ago,)),
                 "players_7d": one("SELECT COUNT(*) FROM players WHERE registration_date >= %s", (week_ago,)),
                 "lobbies_total": one("SELECT COUNT(*) FROM fc_lobbies WHERE status <> 'open'"),
-                "lobbies_active": one("SELECT COUNT(*) FROM fc_lobbies WHERE status IN ('open', 'draft', 'live')"),
+                "lobbies_active": one("SELECT COUNT(*) FROM fc_lobbies WHERE status IN ('open', 'draft', 'veto', 'live')"),
                 "lobbies_completed": one("SELECT COUNT(*) FROM fc_lobbies WHERE status = 'finished'"),
                 "lobbies_today": one("SELECT COUNT(*) FROM fc_lobbies WHERE status <> 'open' AND created_at >= %s", (today,)),
                 "stats_entries": one("SELECT COUNT(*) FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id WHERE l.status = 'finished'"),
@@ -806,7 +806,7 @@ class Database:
     # ======================================================================
     FC_LOBBY_COLS = (
         "id, mode, team_size, map_name, status, captain_ct, captain_t, turn, turn_started_at, "
-        "host_id, topic_thread_id, winner, created_at, filled_at, finished_at"
+        "host_id, topic_thread_id, winner, created_at, filled_at, finished_at, veto_banned"
     )
 
     def _migrate_faceit_tables(self):
@@ -846,6 +846,22 @@ class Database:
                     elo_before INTEGER,
                     elo_delta INTEGER,
                     PRIMARY KEY (lobby_id, user_id)
+                )
+            ''')
+            self.cursor.execute("ALTER TABLE fc_lobbies ADD COLUMN IF NOT EXISTS veto_banned TEXT")
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fc_tickets (
+                    id SERIAL PRIMARY KEY,
+                    reporter_id BIGINT NOT NULL,
+                    accused_id BIGINT NOT NULL,
+                    lobby_id INTEGER NOT NULL,
+                    reason TEXT,
+                    photo_file_id TEXT,
+                    status TEXT DEFAULT 'open',
+                    thread_id INTEGER,
+                    created_at TEXT,
+                    handled_by BIGINT,
+                    handled_at TEXT
                 )
             ''')
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_fc_lp_user ON fc_lobby_players(user_id)")
@@ -925,7 +941,7 @@ class Database:
             self.ensure_connection()
             self.cursor.execute(
                 """SELECT l.id FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
-                   WHERE lp.user_id = %s AND l.status IN ('open', 'draft', 'live')
+                   WHERE lp.user_id = %s AND l.status IN ('open', 'draft', 'veto', 'live')
                    ORDER BY l.id DESC LIMIT 1""",
                 (user_id,),
             )
@@ -981,7 +997,7 @@ class Database:
             capacity = row[1] * 2
             c.execute(
                 """SELECT lp.lobby_id FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
-                   WHERE lp.user_id = %s AND l.status IN ('open', 'draft', 'live') LIMIT 1""",
+                   WHERE lp.user_id = %s AND l.status IN ('open', 'draft', 'veto', 'live') LIMIT 1""",
                 (user_id,),
             )
             existing = c.fetchone()
@@ -1127,12 +1143,95 @@ class Database:
             self.conn.rollback()
             return []
 
+    # ---------- бан карт (маппвето) ----------
+    def fc_start_veto(self, lobby_id, first_turn):
+        """Игроки выбраны: начинаем бан карт. first_turn — команда капитана, который банит первым."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """UPDATE fc_lobbies SET status = 'veto', turn = %s, turn_started_at = %s, veto_banned = ''
+                   WHERE id = %s AND status = 'draft' RETURNING id""",
+                (first_turn, self._now_str(), lobby_id),
+            )
+            ok = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return ok
+        except Exception as e:
+            logger.error(f"Error starting fc veto {lobby_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_ban_map(self, lobby_id, picker_id, map_name, all_maps):
+        """Капитан банит карту. Возвращает (ok, ошибка, осталось_карт, команда_следующего_хода, финальная_карта).
+        Когда остаётся одна карта, она записывается в матч как финальная."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT status, turn, captain_ct, captain_t, veto_banned FROM fc_lobbies WHERE id = %s", (lobby_id,))
+            row = c.fetchone()
+            if not row or row[0] != "veto" or row[1] is None:
+                self.conn.commit()
+                return False, "Бан карт уже завершён.", 0, None, None
+            status, turn, cap_ct, cap_t, banned_raw = row
+            picker_team = "ct" if picker_id == cap_ct else ("t" if picker_id == cap_t else None)
+            if picker_team is None:
+                self.conn.commit()
+                return False, "Банить карты могут только капитаны.", 0, None, None
+            if picker_team != turn:
+                self.conn.commit()
+                return False, "Сейчас не ваш ход.", 0, None, None
+            if map_name not in all_maps:
+                self.conn.commit()
+                return False, "Такой карты нет.", 0, None, None
+            entries = [e for e in (banned_raw or "").split("|") if e]
+            banned_names = [e.split(":", 1)[1] for e in entries]
+            if map_name in banned_names:
+                self.conn.commit()
+                return False, "Эта карта уже забанена.", 0, None, None
+            entries.append(f"{picker_team}:{map_name}")
+            left = [m for m in all_maps if m not in banned_names and m != map_name]
+            if len(left) == 1:
+                c.execute(
+                    "UPDATE fc_lobbies SET veto_banned = %s, map_name = %s, turn = NULL WHERE id = %s",
+                    ("|".join(entries), left[0], lobby_id),
+                )
+                self.conn.commit()
+                return True, None, 1, None, left[0]
+            new_turn = "t" if turn == "ct" else "ct"
+            c.execute(
+                "UPDATE fc_lobbies SET veto_banned = %s, turn = %s, turn_started_at = %s WHERE id = %s",
+                ("|".join(entries), new_turn, self._now_str(), lobby_id),
+            )
+            self.conn.commit()
+            return True, None, len(left), new_turn, None
+        except Exception as e:
+            logger.error(f"Error fc ban map {lobby_id}: {e}")
+            self.conn.rollback()
+            return False, "Ошибка базы данных.", 0, None, None
+
+    def fc_get_turn_timeouts(self, seconds):
+        """Лобби, где ход (выбор игрока или бан карты) идёт дольше seconds секунд: [(lobby_id, status)]."""
+        try:
+            self.ensure_connection()
+            cutoff = (datetime.now() - timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute(
+                "SELECT id, status FROM fc_lobbies WHERE status IN ('draft', 'veto') AND turn IS NOT NULL AND turn_started_at <= %s",
+                (cutoff,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return [(r[0], r[1]) for r in rows]
+        except Exception as e:
+            logger.error(f"Error getting turn timeouts: {e}")
+            self.conn.rollback()
+            return []
+
     # ---------- матч ----------
     def fc_set_live(self, lobby_id, host_id, topic_thread_id=None):
         try:
             self.ensure_connection()
             self.cursor.execute(
-                "UPDATE fc_lobbies SET status = 'live', host_id = %s, topic_thread_id = %s, turn = NULL WHERE id = %s AND status = 'draft' RETURNING id",
+                "UPDATE fc_lobbies SET status = 'live', host_id = %s, topic_thread_id = %s, turn = NULL WHERE id = %s AND status = 'veto' RETURNING id",
                 (host_id, topic_thread_id, lobby_id),
             )
             ok = self.cursor.fetchone() is not None
@@ -1169,7 +1268,7 @@ class Database:
         try:
             self.ensure_connection()
             self.cursor.execute(
-                "UPDATE fc_lobbies SET status = 'cancelled', finished_at = %s WHERE id = %s AND status IN ('open', 'draft', 'live') RETURNING id",
+                "UPDATE fc_lobbies SET status = 'cancelled', finished_at = %s WHERE id = %s AND status IN ('open', 'draft', 'veto', 'live') RETURNING id",
                 (self._now_str(), lobby_id),
             )
             ok = self.cursor.fetchone() is not None
@@ -1381,6 +1480,99 @@ class Database:
             logger.error(f"Error getting device for {user_id}: {e}")
             self.conn.rollback()
             return None
+
+    # ---------- тикеты (жалобы на игроков) ----------
+    def fc_recent_matches(self, user_id, limit=3):
+        """Последние матчи игрока (идущие и завершённые): [(lobby_id, mode, map_name, status, finished_at)]."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT l.id, l.mode, l.map_name, l.status, l.finished_at
+                   FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
+                   WHERE lp.user_id = %s AND l.status IN ('live', 'finished')
+                   ORDER BY l.id DESC LIMIT %s""",
+                (user_id, limit),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"Error getting recent matches for {user_id}: {e}")
+            self.conn.rollback()
+            return []
+
+    def fc_count_recent_tickets(self, user_id, hours=24):
+        try:
+            self.ensure_connection()
+            since = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute(
+                "SELECT COUNT(*) FROM fc_tickets WHERE reporter_id = %s AND created_at >= %s", (user_id, since)
+            )
+            count = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return count
+        except Exception as e:
+            logger.error(f"Error counting tickets for {user_id}: {e}")
+            self.conn.rollback()
+            return 0
+
+    def fc_create_ticket(self, reporter_id, accused_id, lobby_id, reason, photo_file_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO fc_tickets (reporter_id, accused_id, lobby_id, reason, photo_file_id, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                (reporter_id, accused_id, lobby_id, reason, photo_file_id, self._now_str()),
+            )
+            ticket_id = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return ticket_id
+        except Exception as e:
+            logger.error(f"Error creating ticket: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_set_ticket_thread(self, ticket_id, thread_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("UPDATE fc_tickets SET thread_id = %s WHERE id = %s", (thread_id, ticket_id))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error setting ticket thread {ticket_id}: {e}")
+            self.conn.rollback()
+
+    def fc_get_ticket(self, ticket_id):
+        """(id, reporter_id, accused_id, lobby_id, reason, photo_file_id, status, thread_id, created_at) или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT id, reporter_id, accused_id, lobby_id, reason, photo_file_id, status, thread_id, created_at
+                   FROM fc_tickets WHERE id = %s""",
+                (ticket_id,),
+            )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row
+        except Exception as e:
+            logger.error(f"Error getting ticket {ticket_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_resolve_ticket(self, ticket_id, status, handled_by):
+        """Закрывает тикет (resolved / rejected). True — закрыли именно мы."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE fc_tickets SET status = %s, handled_by = %s, handled_at = %s WHERE id = %s AND status = 'open' RETURNING id",
+                (status, handled_by, self._now_str(), ticket_id),
+            )
+            ok = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return ok
+        except Exception as e:
+            logger.error(f"Error resolving ticket {ticket_id}: {e}")
+            self.conn.rollback()
+            return False
 
     def create_indexes(self):
         try:
