@@ -2212,8 +2212,11 @@ async def cleanup_old_messages():
 # ======================================================================
 # FACEIT: автолобби 2x2 / 5x5, выбор игроков капитанами, матчи и ELO
 # ======================================================================
+# ВРЕМЕННО для тестов в одиночку: в режиме «2 на 2» собираются всего 2 игрока (1 против 1).
+# Боевой режим — 4 игрока: поставьте на Render переменную FC_2X2_PLAYERS=4 (код менять не нужно).
+FC_2X2_PLAYERS = _env_int('FC_2X2_PLAYERS', 2)
 FC_MODES = {
-    "2x2": {"team_size": 2, "title": "2×2"},
+    "2x2": {"team_size": max(1, FC_2X2_PLAYERS // 2), "title": "2×2"},
     "5x5": {"team_size": 5, "title": "5×5"},
 }
 FC_MAPS = [
@@ -2269,6 +2272,7 @@ def choose_captains(players):
 async def ensure_open_lobbies():
     """Всегда держим минимум FC_MIN_OPEN_LOBBIES (3) открытых лобби каждого режима. Карту выбирают капитаны."""
     for mode, cfg in FC_MODES.items():
+        db.fc_cancel_stale_open_lobbies(mode, cfg["team_size"])   # пустые лобби со старым размером команды убираем
         open_lobbies = db.fc_get_open_lobbies(mode)
         for _ in range(max(0, FC_MIN_OPEN_LOBBIES - len(open_lobbies))):
             lobby_id = db.fc_create_lobby(mode, cfg["team_size"], None)
@@ -2525,11 +2529,10 @@ async def fc_find(callback_query: types.CallbackQuery):
         return
     await ensure_open_lobbies()
     await cleanup_user_messages(user_id)
-    waiting = {mode: sum(row[2] for row in db.fc_get_open_lobbies(mode)) for mode in FC_MODES}
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            btn(f"2 на 2 · в очереди: {waiting['2x2']}", callback_data="fcmode_2x2", icon="🎮"),
-            btn(f"5 на 5 · в очереди: {waiting['5x5']}", callback_data="fcmode_5x5", icon="🎮"),
+            btn("2 на 2", callback_data="fcmode_2x2", icon="🎮"),
+            btn("5 на 5", callback_data="fcmode_5x5", icon="🎮"),
         ],
         [btn("◀️ Назад", callback_data="back_to_main", icon="◀️")],
     ])
@@ -2693,8 +2696,11 @@ async def start_draft(lobby_id):
     if not db.fc_set_draft(lobby_id, ct["user_id"], t["user_id"], first_turn):
         return
     db.kv_set(f"fc_firstpick:{lobby_id}", first_turn)
-    await ensure_open_lobbies()                  # освободили очередь: сразу появилось новое лобби
-    await refresh_lobby_for_all(lobby_id)
+    await ensure_open_lobbies()                  # лобби освободилось: сразу появилось новое
+    if all(p["team"] for p in db.fc_get_players(lobby_id)):
+        await start_veto(lobby_id)               # выбирать некого (режим 1 на 1) — сразу бан карт
+    else:
+        await refresh_lobby_for_all(lobby_id)
     for p, side in ((ct, "ct"), (t, "t")):
         try:
             await bot.send_message(

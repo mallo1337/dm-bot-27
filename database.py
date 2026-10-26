@@ -935,6 +935,24 @@ class Database:
             self.conn.rollback()
             return []
 
+    def fc_cancel_stale_open_lobbies(self, mode, team_size):
+        """Закрывает пустые открытые лобби режима с устаревшим размером команды (после смены настройки)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """UPDATE fc_lobbies SET status = 'cancelled', finished_at = %s
+                   WHERE mode = %s AND status = 'open' AND team_size <> %s
+                     AND NOT EXISTS (SELECT 1 FROM fc_lobby_players lp WHERE lp.lobby_id = fc_lobbies.id)""",
+                (self._now_str(), mode, int(team_size)),
+            )
+            count = self.cursor.rowcount
+            self.conn.commit()
+            return count
+        except Exception as e:
+            logger.error(f"Error cancelling stale lobbies {mode}: {e}")
+            self.conn.rollback()
+            return 0
+
     def fc_get_user_active_lobby(self, user_id):
         """id лобби/матча (open, draft или live), в котором сейчас игрок, либо None."""
         try:
