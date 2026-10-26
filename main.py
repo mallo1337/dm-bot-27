@@ -3544,8 +3544,26 @@ async def ticket_cancel(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer("Отменено")
 
 
+def player_buttons_keyboard(lobby_id, user_id):
+    """Кнопки со всеми игроками матча (кроме самого заявителя), с отметкой стороны."""
+    rows, row = [], []
+    for p in db.fc_get_players(lobby_id):
+        if p["user_id"] == user_id:
+            continue
+        side = "🔵" if p["team"] == "ct" else ("🟠" if p["team"] == "t" else "▫️")
+        row.append(InlineKeyboardButton(text=f"{side} {p['nickname']}", callback_data=f"ticket_p_{lobby_id}_{p['user_id']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([btn("◀️ К матчам", callback_data="ticket_start", icon="◀️"), btn("❌ Отмена", callback_data="ticket_cancel", icon="❌")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.callback_query(lambda c: c.data.startswith("ticket_m_"))
 async def ticket_pick_match(callback_query: types.CallbackQuery, state: FSMContext):
+    """Шаг 2: матч выбран — показываем всех игроков этого матча кнопками."""
     user_id = callback_query.from_user.id
     try:
         lobby_id = int(callback_query.data.replace("ticket_m_", ""))
@@ -3555,16 +3573,58 @@ async def ticket_pick_match(callback_query: types.CallbackQuery, state: FSMConte
     if lobby_id not in [m[0] for m in db.fc_recent_matches(user_id, 3)]:
         await callback_query.answer("Этот матч недоступен для тикета.", show_alert=True)
         return
-    await state.set_state(TicketStates.waiting_for_reason)
+    await state.set_state(TicketStates.waiting_for_accused)
     await state.update_data(ticket_lobby=lobby_id)
     await cleanup_user_messages(user_id)
     text = (
         f"{pe('🎫')} <b>Тикет · шаг 2 из 4</b>\n\n"
         f"Матч #{lobby_id}.\n"
+        f"Выберите игрока, на которого вы подаёте жалобу:"
+    )
+    await send_message_with_image(user_id, text, None, player_buttons_keyboard(lobby_id, user_id))
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("ticket_p_"))
+async def ticket_pick_player(callback_query: types.CallbackQuery, state: FSMContext):
+    """Шаг 3: игрок выбран — просим описать суть нарушения."""
+    user_id = callback_query.from_user.id
+    try:
+        _, _, lobby_s, accused_s = callback_query.data.split("_")
+        lobby_id, accused_id = int(lobby_s), int(accused_s)
+    except ValueError:
+        await callback_query.answer()
+        return
+    if lobby_id not in [m[0] for m in db.fc_recent_matches(user_id, 3)]:
+        await callback_query.answer("Этот матч недоступен для тикета.", show_alert=True)
+        return
+    accused = next((p for p in db.fc_get_players(lobby_id) if p["user_id"] == accused_id), None)
+    if not accused or accused_id == user_id:
+        await callback_query.answer("Этого игрока нет в матче.", show_alert=True)
+        return
+    await state.set_state(TicketStates.waiting_for_reason)
+    await state.update_data(ticket_lobby=lobby_id, ticket_accused=accused_id)
+    await cleanup_user_messages(user_id)
+    text = (
+        f"{pe('🎫')} <b>Тикет · шаг 3 из 4</b>\n\n"
+        f"Матч #{lobby_id}, игрок: <b>{esc(accused['nickname'])}</b>.\n"
         f"Опишите суть нарушения своими словами (от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов):"
     )
-    await send_message_with_image(user_id, text, None, ticket_cancel_keyboard())
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        btn("◀️ К игрокам", callback_data=f"ticket_m_{lobby_id}", icon="◀️"),
+        btn("❌ Отмена", callback_data="ticket_cancel", icon="❌"),
+    ]])
+    await send_message_with_image(user_id, text, None, kb)
     await callback_query.answer()
+
+
+@dp.message(TicketStates.waiting_for_accused)
+async def ticket_accused_text_ignored(message: types.Message):
+    """Игрока выбирают кнопками — набранный текст на этом шаге просто убираем."""
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 @dp.message(TicketStates.waiting_for_reason)
@@ -3582,39 +3642,7 @@ async def ticket_reason(message: types.Message, state: FSMContext):
             reply_markup=ticket_cancel_keyboard(),
         )
         return
-    data = await state.get_data()
     await state.update_data(ticket_reason=reason)
-    await state.set_state(TicketStates.waiting_for_accused)
-    players = [p["nickname"] for p in db.fc_get_players(data["ticket_lobby"]) if p["user_id"] != user_id]
-    await cleanup_user_messages(user_id)
-    text = (
-        f"{pe('🎫')} <b>Тикет · шаг 3 из 4</b>\n\n"
-        f"Введите никнейм игрока, на которого вы подаёте жалобу.\n"
-        f"Игроки матча: {', '.join(esc(n) for n in players)}"
-    )
-    await send_message_with_image(user_id, text, None, ticket_cancel_keyboard())
-
-
-@dp.message(TicketStates.waiting_for_accused)
-async def ticket_accused(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    nickname = (message.text or "").strip()
-    try:
-        await message.delete()
-    except Exception:
-        pass
-    data = await state.get_data()
-    players = db.fc_get_players(data["ticket_lobby"])
-    accused = next((p for p in players if p["nickname"].lower() == nickname.lower() and p["user_id"] != user_id), None)
-    if not accused:
-        names = ", ".join(esc(p["nickname"]) for p in players if p["user_id"] != user_id)
-        await bot.send_message(
-            chat_id=user_id,
-            text=f"❌ Игрока «{nickname[:30]}» нет в этом матче. Игроки матча: {names}",
-            reply_markup=ticket_cancel_keyboard(),
-        )
-        return
-    await state.update_data(ticket_accused=accused["user_id"])
     await state.set_state(TicketStates.waiting_for_screenshot)
     await cleanup_user_messages(user_id)
     text = (
