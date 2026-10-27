@@ -864,6 +864,8 @@ class Database:
                     handled_at TEXT
                 )
             ''')
+            self.cursor.execute("ALTER TABLE fc_tickets ADD COLUMN IF NOT EXISTS taken_by BIGINT")
+            self.cursor.execute("ALTER TABLE fc_tickets ADD COLUMN IF NOT EXISTS taken_at TEXT")
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_fc_lp_user ON fc_lobby_players(user_id)")
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_fc_lobbies_status ON fc_lobbies(status)")
             self.conn.commit()
@@ -1560,11 +1562,12 @@ class Database:
             self.conn.rollback()
 
     def fc_get_ticket(self, ticket_id):
-        """(id, reporter_id, accused_id, lobby_id, reason, photo_file_id, status, thread_id, created_at) или None."""
+        """(id, reporter_id, accused_id, lobby_id, reason, photo_file_id, status, thread_id, created_at, taken_by)
+        или None. Статусы: open (ждёт модератора), in_progress (взят), closed, failed."""
         try:
             self.ensure_connection()
             self.cursor.execute(
-                """SELECT id, reporter_id, accused_id, lobby_id, reason, photo_file_id, status, thread_id, created_at
+                """SELECT id, reporter_id, accused_id, lobby_id, reason, photo_file_id, status, thread_id, created_at, taken_by
                    FROM fc_tickets WHERE id = %s""",
                 (ticket_id,),
             )
@@ -1591,6 +1594,57 @@ class Database:
             logger.error(f"Error resolving ticket {ticket_id}: {e}")
             self.conn.rollback()
             return False
+
+    def fc_take_ticket(self, ticket_id, admin_id):
+        """Модератор берёт тикет. Возвращает (ok, кто_уже_взял)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """UPDATE fc_tickets SET status = 'in_progress', taken_by = %s, taken_at = %s
+                   WHERE id = %s AND status = 'open' RETURNING id""",
+                (admin_id, self._now_str(), ticket_id),
+            )
+            ok = self.cursor.fetchone() is not None
+            taken_by = None
+            if not ok:
+                self.cursor.execute("SELECT taken_by FROM fc_tickets WHERE id = %s", (ticket_id,))
+                row = self.cursor.fetchone()
+                taken_by = row[0] if row else None
+            self.conn.commit()
+            return ok, taken_by
+        except Exception as e:
+            logger.error(f"Error taking ticket {ticket_id}: {e}")
+            self.conn.rollback()
+            return False, None
+
+    def fc_close_ticket(self, ticket_id, closed_by):
+        """Закрывает взятый тикет вручную. True — закрыли."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """UPDATE fc_tickets SET status = 'closed', handled_by = %s, handled_at = %s
+                   WHERE id = %s AND status = 'in_progress' RETURNING id""",
+                (closed_by, self._now_str(), ticket_id),
+            )
+            ok = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return ok
+        except Exception as e:
+            logger.error(f"Error closing ticket {ticket_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_get_ticket_by_thread(self, thread_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT id FROM fc_tickets WHERE thread_id = %s ORDER BY id DESC LIMIT 1", (thread_id,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error getting ticket by thread {thread_id}: {e}")
+            self.conn.rollback()
+            return None
 
     def create_indexes(self):
         try:

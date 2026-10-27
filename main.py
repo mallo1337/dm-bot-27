@@ -2283,14 +2283,10 @@ def build_lobby_list(mode):
     """Список открытых лобби режима для выбора."""
     cap = FC_MODES[mode]["team_size"] * 2
     lobbies = db.fc_get_open_lobbies(mode)
-    lines = [f"{pe('🎮')} <b>Режим {fc_title(mode)}</b> — выберите лобби", ""]
+    lines = [f"{pe('🎮')} <b>Режим {fc_title(mode)}</b> — выберите лобби"]
     rows = []
     for lobby_id, _map_name, count in lobbies:
-        lines.append(f"Лобби #{lobby_id} · {count}/{cap}")
         rows.append([InlineKeyboardButton(text=f"Лобби #{lobby_id} · {count}/{cap}", callback_data=f"fcview_{lobby_id}")])
-    if not lobbies:
-        lines.append("Лобби создаются, попробуйте через пару секунд.")
-    lines += ["", "Карту выберут капитаны после того, как соберут команды."]
     rows.append([btn("🔄 Обновить", callback_data=f"fclist_{mode}", icon="🔄")])
     rows.append([btn("◀️ Назад", callback_data="fcfind", icon="◀️")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2379,6 +2375,7 @@ def render_lobby(lobby_id, user_id):
         free = [p for p in players if p["team"] is None]
         lines = [
             f"{pe('🏁')} <b>Матч #{lobby_id} — выбор игроков</b>",
+            *( [f"{pe('👑')} Вы капитан · {FC_SIDES[me['team']]}"] if me and me["is_captain"] else [] ),
             "",
             FC_SIDES["ct"],
             *(team_block(players, "ct") or ["—"]),
@@ -2412,6 +2409,7 @@ def render_lobby(lobby_id, user_id):
         turn_cap = next((p for p in players if p["user_id"] == (cap_ct if turn == "ct" else cap_t)), None) if turn else None
         lines = [
             f"{pe('🗺')} <b>Матч #{lobby_id} — бан карт</b>",
+            *( [f"{pe('👑')} Вы капитан · {FC_SIDES[me['team']]}"] if me and me["is_captain"] else [] ),
             "",
             f"{FC_SIDES['ct']}: " + (", ".join(p['nickname'] for p in players if p['team'] == 'ct') or "—"),
             f"{FC_SIDES['t']}: " + (", ".join(p['nickname'] for p in players if p['team'] == 't') or "—"),
@@ -2448,10 +2446,12 @@ def render_lobby(lobby_id, user_id):
         if host:
             lines.append(f"{pe('👑')} Хост: {display_nickname(host['user_id'], host['nickname'])} | ID: <code>{esc(host['game_id'])}</code>")
         if my_side:
-            lines.append(f"Ваша сторона: <b>{my_side}</b>")
+            lines.append(f"Ваша сторона: <b>{my_side}</b>" + (" · 👑 капитан" if me and me["is_captain"] else ""))
         lines += ["", FC_SIDES["ct"], *team_block(players, "ct"), "", FC_SIDES["t"], *team_block(players, "t"), "",
                   "Хост создаёт комнату в игре, остальные заходят по его ID.",
                   f"{pe('📸')} После матча капитан отправляет скриншот результата — модераторы начислят ELO."]
+        if me and me["is_captain"] and db.kv_get(f"fcshot:{lobby_id}:{user_id}"):
+            lines.append(f"{pe('✅')} Скриншот отправлен модераторам — ожидайте начисления ELO.")
         rows = []
         if me and me["is_captain"]:
             rows.append([btn("📸 Отправить результат", callback_data=f"fcshot_{lobby_id}", icon="📸")])
@@ -2486,6 +2486,8 @@ async def _push_once(user_id, text, kb, force_new):
 
 async def push_lobby_view(lobby_id, user_id, force_new=False):
     """Обновляет (или отправляет) игроку единственное сообщение с лобби/матчем."""
+    if force_new:
+        await drop_lobby_message(user_id)
     text, kb = render_lobby(lobby_id, user_id)
     ok_sent = await _push_once(user_id, text, kb, force_new)
     if not ok_sent and _colored_state["on"]:
@@ -2499,9 +2501,29 @@ async def push_lobby_view(lobby_id, user_id, force_new=False):
     return ok_sent
 
 
-async def refresh_lobby_for_all(lobby_id, force_new=False):
+async def drop_lobby_message(user_id):
+    """Удаляет у игрока главное сообщение лобби/матча (в чате остаётся только одно актуальное)."""
+    old = db.kv_get(f"fcmsg:{user_id}")
+    if old:
+        await safe_delete_message(chat_id=user_id, message_id=int(old))
+        db.kv_delete(f"fcmsg:{user_id}")
+
+
+async def refresh_lobby_for_all(lobby_id, force_new=False, new_for=()):
+    """Обновляет главное сообщение у всех игроков. force_new / new_for — удалить старое и прислать новое
+    (так игрок получает уведомление, а в чате всё равно остаётся одно сообщение)."""
     for p in db.fc_get_players(lobby_id):
-        await push_lobby_view(lobby_id, p["user_id"], force_new=force_new)
+        await push_lobby_view(lobby_id, p["user_id"], force_new=force_new or p["user_id"] in new_for)
+
+
+async def refresh_turn(lobby_id):
+    """Ход перешёл к другому капитану: ему приходит новое сообщение, остальным оно обновляется на месте."""
+    lobby = db.fc_get_lobby(lobby_id)
+    if not lobby or not lobby[7]:
+        await refresh_lobby_for_all(lobby_id)
+        return
+    captain_id = lobby[5] if lobby[7] == "ct" else lobby[6]
+    await refresh_lobby_for_all(lobby_id, new_for={captain_id})
 
 
 async def open_lobby_for_user(user_id, lobby_id):
@@ -2700,26 +2722,7 @@ async def start_draft(lobby_id):
     if all(p["team"] for p in db.fc_get_players(lobby_id)):
         await start_veto(lobby_id)               # выбирать некого (режим 1 на 1) — сразу бан карт
     else:
-        await refresh_lobby_for_all(lobby_id)
-    for p, side in ((ct, "ct"), (t, "t")):
-        try:
-            await bot.send_message(
-                chat_id=p["user_id"],
-                text=f"{pe('👑')} Вы капитан команды {FC_SIDES[side]} в матче #{lobby_id}!",
-                parse_mode='HTML',
-            )
-        except Exception as e:
-            logger.info(f"Cannot notify captain {p['user_id']}: {e}")
-    for p in players:
-        if p["user_id"] not in (ct["user_id"], t["user_id"]):
-            try:
-                await bot.send_message(
-                    chat_id=p["user_id"],
-                    text=f"{pe('🏁')} Лобби #{lobby_id} заполнено! Капитаны выбирают игроков в команды.",
-                    parse_mode='HTML',
-                )
-            except Exception as e:
-                logger.info(f"Cannot notify {p['user_id']} about the draft: {e}")
+        await refresh_lobby_for_all(lobby_id, force_new=True)
 
 
 async def after_pick(lobby_id, remaining, next_turn):
@@ -2731,7 +2734,7 @@ async def after_pick(lobby_id, remaining, next_turn):
     if remaining == 0:
         await start_veto(lobby_id)
     else:
-        await refresh_lobby_for_all(lobby_id)
+        await refresh_turn(lobby_id)
 
 
 @dp.callback_query(lambda c: c.data.startswith("fcpick_"))
@@ -2838,15 +2841,7 @@ async def start_veto(lobby_id):
     first_ban = "t" if first_pick == "ct" else "ct"
     if not db.fc_start_veto(lobby_id, first_ban):
         return
-    await refresh_lobby_for_all(lobby_id)
-    lobby = db.fc_get_lobby(lobby_id)
-    for captain_id, side in ((lobby[5], "ct"), (lobby[6], "t")):
-        try:
-            text = (f"{pe('🗺')} Команды собраны! Начинается бан карт — "
-                    + ("ваш ход, вы баните первым." if side == first_ban else "вторым банит ваш соперник."))
-            await bot.send_message(chat_id=captain_id, text=text, parse_mode='HTML')
-        except Exception as e:
-            logger.info(f"Cannot notify captain {captain_id} about veto: {e}")
+    await refresh_lobby_for_all(lobby_id, force_new=True)
 
 
 @dp.callback_query(lambda c: c.data.startswith("fcban_"))
@@ -2876,7 +2871,7 @@ async def after_ban(lobby_id, final_map):
     if final_map:
         await finish_veto(lobby_id)
     else:
-        await refresh_lobby_for_all(lobby_id)
+        await refresh_turn(lobby_id)
 
 
 async def auto_ban(lobby_id):
@@ -2909,17 +2904,7 @@ async def finish_veto(lobby_id):
     thread_id = await create_match_topic(lobby_id)
     if thread_id:
         db.fc_set_topic(lobby_id, thread_id)
-    await refresh_lobby_for_all(lobby_id)
-    map_name = db.fc_get_lobby(lobby_id)[3]
-    for p in players:
-        try:
-            await bot.send_message(
-                chat_id=p["user_id"],
-                text=f"{pe('🎮')} Матч #{lobby_id} начался! Карта: {map_name}. Сторона и хост — в сообщении с лобби выше.",
-                parse_mode='HTML',
-            )
-        except Exception as e:
-            logger.info(f"Cannot notify {p['user_id']} about match start: {e}")
+    await refresh_lobby_for_all(lobby_id, force_new=True)
 
 
 # ---------- результат матча ----------
@@ -2939,37 +2924,51 @@ async def fc_screenshot_start(callback_query: types.CallbackQuery, state: FSMCon
         return
     await state.set_state(FcStates.waiting_for_result_screenshot)
     await state.update_data(fc_lobby_id=lobby_id)
-    await callback_query.message.answer(
+    await drop_lobby_message(user_id)
+    await cleanup_user_messages(user_id)
+    await send_message_with_image(
+        user_id,
         f"{pe('📸')} Отправьте скриншот с итоговым счётом матча #{lobby_id} одним фото.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="fcshot_cancel", icon="❌")]]),
-        parse_mode='HTML',
+        None,
+        InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data=f"fcshot_cancel", icon="❌")]]),
     )
     await callback_query.answer()
 
 
 @dp.callback_query(lambda c: c.data == "fcshot_cancel")
 async def fc_screenshot_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    lobby_id = data.get("fc_lobby_id")
     await state.clear()
-    try:
-        await callback_query.message.delete()
-    except Exception:
-        pass
+    user_id = callback_query.from_user.id
+    await cleanup_user_messages(user_id)
+    if lobby_id:
+        await open_lobby_for_user(user_id, lobby_id)
     await callback_query.answer("Отменено")
 
 
 @dp.message(FcStates.waiting_for_result_screenshot)
 async def fc_screenshot_received(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
     data = await state.get_data()
     lobby_id = data.get("fc_lobby_id")
+    try:
+        await message.delete()
+    except Exception:
+        pass
     if not message.photo:
-        await message.answer("❌ Нужно отправить фото (скриншот).")
+        await cleanup_user_messages(user_id)
+        await send_message_with_image(
+            user_id, f"{pe('❌')} Нужно отправить фото (скриншот) одним сообщением.", None,
+            InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="fcshot_cancel", icon="❌")]]),
+        )
         return
     lobby = db.fc_get_lobby(lobby_id) if lobby_id else None
     if not lobby or lobby[4] != "live":
         await state.clear()
-        await message.answer("Матч уже завершён или отменён.")
+        await cleanup_user_messages(user_id)
+        await send_message_with_image(user_id, f"{pe('❌')} Матч уже завершён или отменён.", None, get_main_keyboard(user_id))
         return
-    user_id = message.from_user.id
     me = next((p for p in db.fc_get_players(lobby_id) if p["user_id"] == user_id), None)
     caption = (
         f"📸 Результат матча #{lobby_id}\n"
@@ -2984,10 +2983,16 @@ async def fc_screenshot_received(message: types.Message, state: FSMContext):
             )
     except Exception as e:
         logger.error(f"Cannot forward result screenshot: {e}")
-        await message.answer("❌ Не удалось отправить скриншот модераторам, попробуйте ещё раз.")
+        await cleanup_user_messages(user_id)
+        await send_message_with_image(
+            user_id, f"{pe('❌')} Не удалось отправить скриншот модераторам, попробуйте ещё раз.", None,
+            InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="fcshot_cancel", icon="❌")]]),
+        )
         return
+    db.kv_set(f"fcshot:{lobby_id}:{user_id}", 1)
     await state.clear()
-    await message.answer(f"{pe('✅')} Скриншот отправлен модераторам. Ожидайте начисления ELO.", parse_mode='HTML')
+    await cleanup_user_messages(user_id)
+    await open_lobby_for_user(user_id, lobby_id)
 
 
 def parse_kd_lines(text, players):
@@ -3100,7 +3105,8 @@ def build_result_text(lobby_id, results, winner):
 
 async def notify_match_result(lobby_id, results):
     for r in results:
-        db.kv_delete(f"fcmsg:{r['user_id']}")
+        await drop_lobby_message(r["user_id"])
+        await cleanup_user_messages(r["user_id"])
         kd = f"\n{pe('🎯')} K/D матча: {r['kills']}/{r['deaths']}" if (r["kills"] or r["deaths"]) else ""
         text = (
             f"{pe('🏁')} <b>Матч #{lobby_id} завершён</b>\n"
@@ -3110,8 +3116,7 @@ async def notify_match_result(lobby_id, results):
             f"{kd}\n{pe('📈')} Уровень: {get_player_level(r['elo_after'])}"
         )
         try:
-            await bot.send_message(chat_id=r["user_id"], text=text, parse_mode='HTML',
-                                   reply_markup=get_main_keyboard(r["user_id"]))
+            await send_message_with_image(r["user_id"], text, None, get_main_keyboard(r["user_id"]))
         except Exception as e:
             logger.info(f"Cannot notify {r['user_id']} about result: {e}")
 
@@ -3215,11 +3220,12 @@ async def fc_cancel_match(callback_query: types.CallbackQuery):
     except Exception:
         pass
     for p in players:
-        db.kv_delete(f"fcmsg:{p['user_id']}")
+        await drop_lobby_message(p["user_id"])
+        await cleanup_user_messages(p["user_id"])
         try:
-            await bot.send_message(
-                chat_id=p["user_id"], text=f"{pe('❌')} Матч #{lobby_id} отменён модераторами. ELO не изменилось.",
-                parse_mode='HTML', reply_markup=get_main_keyboard(p["user_id"]),
+            await send_message_with_image(
+                p["user_id"], f"{pe('❌')} Матч #{lobby_id} отменён модераторами. ELO не изменилось.",
+                None, get_main_keyboard(p["user_id"]),
             )
         except Exception as e:
             logger.info(f"Cannot notify {p['user_id']} about cancel: {e}")
@@ -3469,7 +3475,7 @@ async def _show_filtered_lobby_history(user_id, mode_idx, map_idx, days, offset)
 
 
 # ======================================================================
-# ТИКЕТЫ (поддержка): жалоба на игрока по матчу → тема в группе модераторов
+# ТИКЕТЫ (поддержка): жалоба на игрока → тема в группе модераторов → модератор «берёт» тикет
 # ======================================================================
 TICKET_DAILY_LIMIT = _env_int('TICKET_DAILY_LIMIT', 3)     # сколько тикетов может подать игрок за сутки
 TICKET_REASON_MIN = 5
@@ -3490,23 +3496,24 @@ def ticket_number(ticket_id):
     return f"{ticket_id:05d}"
 
 
+async def ticket_notice(user_id, text, keyboard):
+    """Одно сообщение бота в чате: предыдущее удаляем, новое запоминаем (чтобы потом тоже удалить)."""
+    await cleanup_user_messages(user_id)
+    await send_message_with_image(user_id, text, None, keyboard)
+
+
 async def begin_ticket(user_id, state):
     """Шаг 1: выбор матча из последних трёх."""
     await state.clear()
-    await cleanup_user_messages(user_id)
     if not db.is_user_registered(user_id):
-        await send_message_with_image(user_id, f"{pe('❌')} Сначала зарегистрируйтесь через /start.", None, fc_back_keyboard())
+        await ticket_notice(user_id, f"{pe('❌')} Сначала зарегистрируйтесь через /start.", fc_back_keyboard())
         return
     if db.fc_count_recent_tickets(user_id) >= TICKET_DAILY_LIMIT:
-        await send_message_with_image(
-            user_id, f"{pe('❌')} Лимит тикетов на сегодня исчерпан ({TICKET_DAILY_LIMIT}). Попробуйте завтра.", None, fc_back_keyboard()
-        )
+        await ticket_notice(user_id, f"{pe('❌')} Лимит тикетов на сегодня исчерпан ({TICKET_DAILY_LIMIT}). Попробуйте завтра.", fc_back_keyboard())
         return
     matches = db.fc_recent_matches(user_id, 3)
     if not matches:
-        await send_message_with_image(
-            user_id, f"{pe('❌')} У вас пока нет матчей, по которым можно подать тикет.", None, fc_back_keyboard()
-        )
+        await ticket_notice(user_id, f"{pe('❌')} У вас пока нет матчей, по которым можно подать тикет.", fc_back_keyboard())
         return
     rows = [
         [InlineKeyboardButton(text=f"#{lobby_id} · {fc_title(mode)} · {map_name or '—'}", callback_data=f"ticket_m_{lobby_id}")]
@@ -3517,7 +3524,7 @@ async def begin_ticket(user_id, state):
         f"{pe('🎫')} <b>Тикет · шаг 1 из 4</b>\n\n"
         f"Выберите матч, в котором произошло нарушение (последние три):"
     )
-    await send_message_with_image(user_id, text, None, InlineKeyboardMarkup(inline_keyboard=rows))
+    await ticket_notice(user_id, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @dp.message(Command("ticket"))
@@ -3539,8 +3546,7 @@ async def ticket_start(callback_query: types.CallbackQuery, state: FSMContext):
 async def ticket_cancel(callback_query: types.CallbackQuery, state: FSMContext):
     await state.clear()
     user_id = callback_query.from_user.id
-    await cleanup_user_messages(user_id)
-    await send_message_with_image(user_id, f"{pe('👋')} Тикет отменён.\n\nВыберите действие:", MENU_IMAGE_URL, get_main_keyboard(user_id))
+    await ticket_notice(user_id, f"{pe('👋')} Тикет отменён.\n\nВыберите действие:", get_main_keyboard(user_id))
     await callback_query.answer("Отменено")
 
 
@@ -3561,6 +3567,13 @@ def player_buttons_keyboard(lobby_id, user_id):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def reason_keyboard(lobby_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        btn("◀️ К игрокам", callback_data=f"ticket_m_{lobby_id}", icon="◀️"),
+        btn("❌ Отмена", callback_data="ticket_cancel", icon="❌"),
+    ]])
+
+
 @dp.callback_query(lambda c: c.data.startswith("ticket_m_"))
 async def ticket_pick_match(callback_query: types.CallbackQuery, state: FSMContext):
     """Шаг 2: матч выбран — показываем всех игроков этого матча кнопками."""
@@ -3575,13 +3588,12 @@ async def ticket_pick_match(callback_query: types.CallbackQuery, state: FSMConte
         return
     await state.set_state(TicketStates.waiting_for_accused)
     await state.update_data(ticket_lobby=lobby_id)
-    await cleanup_user_messages(user_id)
     text = (
         f"{pe('🎫')} <b>Тикет · шаг 2 из 4</b>\n\n"
         f"Матч #{lobby_id}.\n"
         f"Выберите игрока, на которого вы подаёте жалобу:"
     )
-    await send_message_with_image(user_id, text, None, player_buttons_keyboard(lobby_id, user_id))
+    await ticket_notice(user_id, text, player_buttons_keyboard(lobby_id, user_id))
     await callback_query.answer()
 
 
@@ -3604,17 +3616,12 @@ async def ticket_pick_player(callback_query: types.CallbackQuery, state: FSMCont
         return
     await state.set_state(TicketStates.waiting_for_reason)
     await state.update_data(ticket_lobby=lobby_id, ticket_accused=accused_id)
-    await cleanup_user_messages(user_id)
     text = (
         f"{pe('🎫')} <b>Тикет · шаг 3 из 4</b>\n\n"
         f"Матч #{lobby_id}, игрок: <b>{esc(accused['nickname'])}</b>.\n"
         f"Опишите суть нарушения своими словами (от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов):"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        btn("◀️ К игрокам", callback_data=f"ticket_m_{lobby_id}", icon="◀️"),
-        btn("❌ Отмена", callback_data="ticket_cancel", icon="❌"),
-    ]])
-    await send_message_with_image(user_id, text, None, kb)
+    await ticket_notice(user_id, text, reason_keyboard(lobby_id))
     await callback_query.answer()
 
 
@@ -3635,28 +3642,31 @@ async def ticket_reason(message: types.Message, state: FSMContext):
         await message.delete()
     except Exception:
         pass
+    data = await state.get_data()
     if len(reason) < TICKET_REASON_MIN or len(reason) > TICKET_REASON_MAX:
-        await bot.send_message(
-            chat_id=user_id,
-            text=f"❌ Опишите нарушение текстом от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов (сейчас {len(reason)}).",
-            reply_markup=ticket_cancel_keyboard(),
+        await ticket_notice(
+            user_id,
+            f"{pe('❌')} Опишите нарушение текстом от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов (сейчас {len(reason)}).",
+            reason_keyboard(data.get("ticket_lobby", 0)),
         )
         return
     await state.update_data(ticket_reason=reason)
     await state.set_state(TicketStates.waiting_for_screenshot)
-    await cleanup_user_messages(user_id)
     text = (
         f"{pe('🎫')} <b>Тикет · шаг 4 из 4</b>\n\n"
         f"Отправьте скриншот нарушения <b>одним фото</b> (как фото, а не файлом)."
     )
-    await send_message_with_image(user_id, text, None, ticket_cancel_keyboard())
+    await ticket_notice(user_id, text, ticket_cancel_keyboard())
 
 
 def ticket_keyboard(ticket_id):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        btn("✅ Принят", callback_data=f"tk_ok_{ticket_id}", icon="✅"),
-        btn("❌ Отклонён", callback_data=f"tk_no_{ticket_id}", icon="❌"),
-    ]])
+    """Под новым тикетом одна кнопка: модератор берёт тикет на себя."""
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("🙋 Взять тикет", callback_data=f"tk_take_{ticket_id}", icon="🙋")]])
+
+
+def ticket_taken_keyboard(ticket_id):
+    """После того как тикет взяли — одна кнопка: закрыть вручную."""
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("🔒 Закрыть тикет", callback_data=f"tk_close_{ticket_id}", icon="🔒")]])
 
 
 def build_ticket_caption(ticket_id, lobby, reporter_nick, accused_nick, reason):
@@ -3672,6 +3682,35 @@ def build_ticket_caption(ticket_id, lobby, reporter_nick, accused_nick, reason):
     )
 
 
+async def collect_moderators():
+    """Все модераторы: администраторы группы модераторов + администраторы бота. {user_id: имя}"""
+    mods = {}
+    if MODERATOR_GROUP_ID:
+        try:
+            for member in await bot.get_chat_administrators(int(MODERATOR_GROUP_ID)):
+                user = getattr(member, "user", None)
+                if user and not getattr(user, "is_bot", False):
+                    mods[user.id] = user.full_name
+        except Exception as e:
+            logger.warning(f"Cannot load moderator group administrators: {e}")
+    for uid in ADMINS:
+        if uid not in mods:
+            profile = db.get_player_profile(uid)
+            mods[uid] = profile[2] if profile else "модератор"
+    return mods
+
+
+async def call_moderators(thread_id, ticket_id):
+    """Зовёт всех модераторов в тему тикета: просит взять его на себя."""
+    mods = await collect_moderators()
+    mentions = ", ".join(f'<a href="tg://user?id={uid}">{esc(name)}</a>' for uid, name in mods.items())
+    text = f"{pe('🔔')} Тикет #{ticket_number(ticket_id)} ждёт модератора. Нажмите «Взять тикет» под сообщением выше.\n\n{mentions}"
+    try:
+        await bot.send_message(chat_id=int(MODERATOR_GROUP_ID), message_thread_id=thread_id, text=text, parse_mode='HTML')
+    except Exception as e:
+        logger.warning(f"Cannot call moderators for ticket {ticket_id}: {e}")
+
+
 @dp.message(TicketStates.waiting_for_screenshot)
 async def ticket_screenshot(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -3680,25 +3719,27 @@ async def ticket_screenshot(message: types.Message, state: FSMContext):
             await message.delete()
         except Exception:
             pass
-        await bot.send_message(
-            chat_id=user_id, text="❌ Нужен скриншот именно фотографией. Отправьте одно фото.", reply_markup=ticket_cancel_keyboard()
-        )
+        await ticket_notice(user_id, f"{pe('❌')} Нужен скриншот именно фотографией. Отправьте одно фото.", ticket_cancel_keyboard())
         return
     data = await state.get_data()
     lobby_id, accused_id, reason = data.get("ticket_lobby"), data.get("ticket_accused"), data.get("ticket_reason")
     lobby = db.fc_get_lobby(lobby_id) if lobby_id else None
+    try:
+        await message.delete()
+    except Exception:
+        pass
     if not lobby or not accused_id or not reason:
         await state.clear()
-        await message.answer("Данные тикета потерялись, начните заново: /ticket")
+        await ticket_notice(user_id, f"{pe('❌')} Данные тикета потерялись, начните заново: /ticket", fc_back_keyboard())
         return
     if not MODERATOR_GROUP_ID:
         await state.clear()
-        await message.answer("❌ Приём тикетов сейчас недоступен. Напишите администратору.")
+        await ticket_notice(user_id, f"{pe('❌')} Приём тикетов сейчас недоступен. Напишите администратору.", fc_back_keyboard())
         return
     file_id = message.photo[-1].file_id
     ticket_id = db.fc_create_ticket(user_id, accused_id, lobby_id, reason, file_id)
     if not ticket_id:
-        await message.answer("❌ Не удалось сохранить тикет, попробуйте позже.")
+        await ticket_notice(user_id, f"{pe('❌')} Не удалось сохранить тикет, попробуйте позже.", fc_back_keyboard())
         return
     reporter = db.get_player_profile(user_id)
     accused = db.get_player_profile(accused_id)
@@ -3717,55 +3758,137 @@ async def ticket_screenshot(message: types.Message, state: FSMContext):
         logger.error(f"Cannot deliver ticket {ticket_id} to moderators: {e}")
         db.fc_resolve_ticket(ticket_id, "failed", 0)
         await state.clear()
-        await message.answer("❌ Не удалось отправить тикет модераторам. Попробуйте ещё раз: /ticket")
+        await ticket_notice(user_id, f"{pe('❌')} Не удалось отправить тикет модераторам. Попробуйте ещё раз: /ticket", fc_back_keyboard())
         return
+    await call_moderators(thread_id, ticket_id)
     await state.clear()
-    try:
-        await message.delete()
-    except Exception:
-        pass
-    await cleanup_user_messages(user_id)
-    await send_message_with_image(
+    await ticket_notice(
         user_id,
-        f"{pe('✅')} Тикет #{ticket_number(ticket_id)} отправлен модераторам. Мы сообщим о решении.",
-        MENU_IMAGE_URL, get_main_keyboard(user_id),
+        f"{pe('✅')} Тикет #{ticket_number(ticket_id)} отправлен модераторам. Мы сообщим, когда его возьмут в работу.",
+        get_main_keyboard(user_id),
     )
 
 
-@dp.callback_query(lambda c: c.data.startswith("tk_ok_") or c.data.startswith("tk_no_"))
-async def ticket_resolve(callback_query: types.CallbackQuery):
-    if not is_admin(callback_query.from_user.id):
-        await callback_query.answer("Только для администраторов.", show_alert=True)
-        return
-    accepted = callback_query.data.startswith("tk_ok_")
+async def edit_ticket_caption(message, extra_line, keyboard):
     try:
-        ticket_id = int(callback_query.data.split("_")[2])
-    except (ValueError, IndexError):
+        base = message.html_text if getattr(message, "html_text", None) else (message.caption or "")
+        await message.edit_caption(caption=f"{base}\n\n{extra_line}", parse_mode='HTML', reply_markup=keyboard)
+    except Exception as e:
+        logger.warning(f"Cannot edit ticket caption: {e}")
+
+
+def moderator_link(user):
+    return f'<a href="tg://user?id={user.id}">{esc(user.full_name)}</a>'
+
+
+@dp.callback_query(lambda c: c.data.startswith("tk_take_"))
+async def ticket_take(callback_query: types.CallbackQuery):
+    """Модератор нажимает «Взять тикет»: тикет закрепляется за ним."""
+    admin = callback_query.from_user
+    if not is_admin(admin.id):
+        await callback_query.answer("Только для модераторов.", show_alert=True)
+        return
+    try:
+        ticket_id = int(callback_query.data.replace("tk_take_", ""))
+    except ValueError:
         await callback_query.answer()
         return
     ticket = db.fc_get_ticket(ticket_id)
     if not ticket:
         await callback_query.answer("Тикет не найден.", show_alert=True)
         return
-    if not db.fc_resolve_ticket(ticket_id, "resolved" if accepted else "rejected", callback_query.from_user.id):
-        await callback_query.answer("Тикет уже обработан.", show_alert=True)
+    ok_take, taken_by = db.fc_take_ticket(ticket_id, admin.id)
+    if not ok_take:
+        if taken_by:
+            profile = db.get_player_profile(taken_by)
+            who = profile[2] if profile else str(taken_by)
+            await callback_query.answer(f"Тикет уже взял модератор {who}.", show_alert=True)
+        else:
+            await callback_query.answer("Тикет уже обработан.", show_alert=True)
         return
-    db.log_admin_action(callback_query.from_user.id, "ticket_resolved" if accepted else "ticket_rejected", ticket[2], f"ticket #{ticket_number(ticket_id)}")
-    verdict = "✅ Принят" if accepted else "❌ Отклонён"
-    try:
-        base = callback_query.message.html_text if getattr(callback_query.message, "html_text", None) else (callback_query.message.caption or "")
-        await callback_query.message.edit_caption(
-            caption=f"{base}\n\n{verdict} — {esc(callback_query.from_user.full_name)}", parse_mode='HTML', reply_markup=None
-        )
-    except Exception as e:
-        logger.warning(f"Cannot edit ticket caption: {e}")
+    db.log_admin_action(admin.id, "ticket_taken", ticket[2], f"ticket #{ticket_number(ticket_id)}")
+    reporter = db.get_player_profile(ticket[1])
+    contact = f'<a href="tg://user?id={ticket[1]}">{esc(reporter[2] if reporter else ticket[1])}</a>'
+    username = f" ({esc(reporter[1])})" if reporter and reporter[1] else ""
+    await edit_ticket_caption(
+        callback_query.message,
+        f"{pe('👮')} Тикет взял: {moderator_link(admin)}\n"
+        f"💬 Игрок: {contact}{username} · TG_ID:<code>{ticket[1]}</code>\n"
+        f"Ответить игроку: напишите ему напрямую или командой /answer текст в этой теме. "
+        f"Когда всё решено — нажмите «Закрыть тикет».",
+        ticket_taken_keyboard(ticket_id),
+    )
     try:
         await bot.send_message(
             chat_id=ticket[1],
-            text=(f"{pe('✅')} Ваш тикет #{ticket_number(ticket_id)} рассмотрен: нарушение подтверждено, меры приняты."
-                  if accepted else
-                  f"{pe('❌')} Ваш тикет #{ticket_number(ticket_id)} рассмотрен и отклонён: нарушений не найдено."),
+            text=f"{pe('👮')} Ваш тикет #{ticket_number(ticket_id)} взят в работу. Модератор свяжется с вами.",
             parse_mode='HTML',
+        )
+    except Exception as e:
+        logger.info(f"Cannot notify reporter {ticket[1]}: {e}")
+    await callback_query.answer("Тикет ваш")
+
+
+@dp.message(Command("answer"))
+async def cmd_ticket_answer(message: types.Message):
+    """В теме тикета: /answer текст — бот передаёт ответ игроку."""
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Нет прав для этой команды.")
+        return
+    ticket_id = db.fc_get_ticket_by_thread(message.message_thread_id) if message.message_thread_id else None
+    ticket = db.fc_get_ticket(ticket_id) if ticket_id else None
+    if not ticket:
+        await message.answer("❌ Команда работает только внутри темы тикета.")
+        return
+    if ticket[6] != "in_progress":
+        await message.answer("❌ Сначала возьмите тикет, нажав «Взять тикет».")
+        return
+    if ticket[9] != message.from_user.id and not is_owner(message.from_user.id):
+        await message.answer("❌ Отвечать может только модератор, который взял тикет.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Формат: /answer текст ответа игроку")
+        return
+    try:
+        await bot.send_message(
+            chat_id=ticket[1],
+            text=f"{pe('💬')} Ответ модератора по тикету #{ticket_number(ticket_id)}:\n\n{esc(parts[1].strip())}",
+            parse_mode='HTML',
+        )
+        await message.answer("✅ Ответ отправлен игроку.")
+    except Exception as e:
+        logger.warning(f"Cannot send ticket answer: {e}")
+        await message.answer("❌ Не удалось отправить ответ игроку (возможно, он заблокировал бота). Напишите ему напрямую.")
+
+
+@dp.callback_query(lambda c: c.data.startswith("tk_close_"))
+async def ticket_close(callback_query: types.CallbackQuery):
+    """Модератор закрывает тикет вручную (может только тот, кто его взял)."""
+    admin = callback_query.from_user
+    if not is_admin(admin.id):
+        await callback_query.answer("Только для модераторов.", show_alert=True)
+        return
+    try:
+        ticket_id = int(callback_query.data.replace("tk_close_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    ticket = db.fc_get_ticket(ticket_id)
+    if not ticket:
+        await callback_query.answer("Тикет не найден.", show_alert=True)
+        return
+    if ticket[9] != admin.id and not is_owner(admin.id):
+        await callback_query.answer("Закрыть тикет может только модератор, который его взял.", show_alert=True)
+        return
+    if not db.fc_close_ticket(ticket_id, admin.id):
+        await callback_query.answer("Тикет уже закрыт.", show_alert=True)
+        return
+    db.log_admin_action(admin.id, "ticket_closed", ticket[2], f"ticket #{ticket_number(ticket_id)}")
+    await edit_ticket_caption(callback_query.message, f"🔒 Тикет закрыт — {moderator_link(admin)}", None)
+    try:
+        await bot.send_message(
+            chat_id=ticket[1], text=f"{pe('🔒')} Ваш тикет #{ticket_number(ticket_id)} закрыт.", parse_mode='HTML',
         )
     except Exception as e:
         logger.info(f"Cannot notify reporter {ticket[1]}: {e}")
@@ -3774,7 +3897,12 @@ async def ticket_resolve(callback_query: types.CallbackQuery):
             await bot.close_forum_topic(chat_id=int(MODERATOR_GROUP_ID), message_thread_id=ticket[7])
         except Exception as e:
             logger.info(f"Cannot close ticket topic: {e}")
-    await callback_query.answer("Готово")
+    await callback_query.answer("Тикет закрыт")
+
+
+@dp.callback_query(lambda c: c.data.startswith("tk_ok_") or c.data.startswith("tk_no_"))
+async def ticket_legacy_buttons(callback_query: types.CallbackQuery):
+    await callback_query.answer("Эта кнопка устарела: теперь тикет нужно «Взять», а затем «Закрыть».", show_alert=True)
 
 
 # ======================================================================
@@ -3865,6 +3993,10 @@ async def start_registration(callback_query: types.CallbackQuery, state: FSMCont
     user_id = callback_query.from_user.id
     if db.is_user_registered(user_id):
         await callback_query.answer("Вы уже зарегистрированы.", show_alert=True)
+        return
+    if not is_gate_passed(user_id):
+        await send_gate(user_id)
+        await callback_query.answer()
         return
     await state.clear()
     await state.set_state(RegistrationStates.waiting_for_nickname)
@@ -4041,7 +4173,8 @@ def build_profile_text(user_id):
     lines += [
         "",
         f"{pe('📊')} K/D: {kd_value(kills, deaths):.2f}",
-        f"🔫 Убийства: {kills} · 💀 Смерти: {deaths}",
+        f"🔫 Убийства: {kills}",
+        f"💀 Смерти: {deaths}",
         f"{pe('🏆')} Винрейт: {winrate}",
     ]
     return "\n".join(lines)
@@ -4115,6 +4248,115 @@ async def show_all_time_top(callback_query: types.CallbackQuery):
         await callback_query.answer("Ошибка при загрузке топа.", show_alert=True)
 
 
+# ---------- проверка подписки при первом запуске ----------
+SUBSCRIBE_CHANNEL_URL = os.getenv('SUBSCRIBE_CHANNEL_URL')                 # ссылка на канал для кнопки
+SUBSCRIBE_CHAT_URL = os.getenv('SUBSCRIBE_CHAT_URL')                       # ссылка на чат для кнопки
+SUBSCRIBE_CHANNEL_ID = os.getenv('SUBSCRIBE_CHANNEL_ID') or (CHANNEL_ID if SUBSCRIBE_CHANNEL_URL else None)
+SUBSCRIBE_CHAT_ID = os.getenv('SUBSCRIBE_CHAT_ID')                         # id или @username чата (бот должен быть в нём)
+REGISTRATION_IMAGE_URL = os.getenv(
+    'REGISTRATION_IMAGE_URL',
+    'https://i.ibb.co/Wp6V86Gf/Screenshot-20261025-144356-Nero-AI-Image-Upscaler-Photo-Face.jpg',
+)
+_image_url_cache = {}
+
+
+async def resolve_image_url(url):
+    """Если дали страницу ibb.co вместо прямой ссылки на файл — находим картинку на странице."""
+    if not url or "://ibb.co/" not in url:
+        return url
+    if url in _image_url_cache:
+        return _image_url_cache[url]
+    direct = url
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get(url) as response:
+                page = await response.text()
+        found = re.search(r'property="og:image"\s+content="([^"]+)"', page) or re.search(r'content="([^"]+)"\s+property="og:image"', page)
+        if found:
+            direct = html.unescape(found.group(1))
+    except Exception as e:
+        logger.warning(f"Cannot resolve image url {url}: {e}")
+    _image_url_cache[url] = direct
+    return direct
+
+
+def gate_enabled():
+    return bool(SUBSCRIBE_CHANNEL_ID or SUBSCRIBE_CHAT_ID)
+
+
+def is_gate_passed(user_id):
+    return (not gate_enabled()) or bool(db.kv_get(f"subok:{user_id}"))
+
+
+async def check_subscription(user_id):
+    """Возвращает (чего_не_хватает, ошибки): списки 'канал' / 'чат'."""
+    missing, errors = [], []
+    for label, chat in (("канал", SUBSCRIBE_CHANNEL_ID), ("чат", SUBSCRIBE_CHAT_ID)):
+        if not chat:
+            continue
+        chat_ref = int(chat) if str(chat).lstrip("-").isdigit() else chat
+        try:
+            member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
+            status = getattr(member, "status", None)
+            joined = status in ("creator", "administrator", "member") or (
+                status == "restricted" and bool(getattr(member, "is_member", False))
+            )
+            if not joined:
+                missing.append(label)
+        except Exception as e:
+            logger.error(f"Cannot check subscription ({label}) for {user_id}: {e}")
+            errors.append(label)
+    return missing, errors
+
+
+async def send_gate(user_id):
+    await cleanup_user_messages(user_id)
+    text = (
+        f"{pe('🧩')} <i>Туториал по регистрации</i>\n\n"
+        f"{pe('👋')} <b>Добро пожаловать в King Faceit!</b>\n\n"
+        f"Здесь ты сможешь участвовать в матчах, прокачивать ELO и выигрывать призы.\n\n"
+        f"{pe('🔒')} <b>Доступ ограничен</b>\n"
+        f"Для начала работы необходимо выполнить условия:\n"
+        f"1. Подписаться на наш Канал.\n"
+        f"2. Вступить в наш Чат."
+    )
+    rows = []
+    if SUBSCRIBE_CHANNEL_URL:
+        rows.append([btn("📢 Подписаться на канал", url=SUBSCRIBE_CHANNEL_URL, icon="📢")])
+    if SUBSCRIBE_CHAT_URL:
+        rows.append([btn("💬 Вступить в Чат", url=SUBSCRIBE_CHAT_URL, icon="💬")])
+    rows.append([btn("⚡️ Я подписался", callback_data="sub_check", icon="⚡️")])
+    image = await resolve_image_url(REGISTRATION_IMAGE_URL)
+    await send_message_with_image(user_id, text, image, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(lambda c: c.data == "sub_check")
+async def sub_check(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    if db.is_user_registered(user_id):
+        await callback_query.answer("Вы уже зарегистрированы.", show_alert=True)
+        return
+    missing, errors = await check_subscription(user_id)
+    if errors:
+        await callback_query.answer(
+            "⚠️ Не удалось проверить подписку. Администратору: бот должен быть админом канала и участником чата.",
+            show_alert=True,
+        )
+        return
+    if missing:
+        await callback_query.answer(
+            f"❌ Не выполнено: {', '.join(missing)}. Выполните условия и нажмите «Я подписался» ещё раз.",
+            show_alert=True,
+        )
+        return
+    db.kv_set(f"subok:{user_id}", 1)
+    await state.clear()
+    await state.set_state(RegistrationStates.waiting_for_nickname)
+    await ask_nickname(user_id)
+    await callback_query.answer("✅ Спасибо за подписку!")
+
+
 # ---------- главное меню и /start ----------
 def get_main_keyboard(user_id=None):
     """Главное меню: большая «Найти матч», в два столбца «Профиль» и «Топ», затем большие Premium, «Промокод» и «Тикет»."""
@@ -4159,6 +4401,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
             MENU_IMAGE_URL,
             get_main_keyboard(user_id),
         )
+    elif not is_gate_passed(user_id):
+        await send_gate(user_id)
     else:
         await send_message_with_image(
             user_id,
