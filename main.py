@@ -444,7 +444,7 @@ def premium_until_human(premium_until_str):
 def post_purchase_menu_caption(first_name: str, days: int) -> str:
     return (
         f"Благодарим за покупку! Вам выдан Premium на {days} дней.\n\n"
-        f"{pe('👋')} Привет, {esc(first_name)}!\n\nВыберите действие:"
+        f"{pe('👋')} Привет, {esc(first_name)}!"
     )
 
 
@@ -749,11 +749,11 @@ async def cmd_botstat(message: types.Message):
         return
 
     try:
-        db.cursor.execute("SELECT COUNT(*) FROM players")
+        db.cursor.execute("SELECT COUNT(*) FROM players WHERE user_id > 0")
         total_users = db.cursor.fetchone()[0]
 
         today = datetime.now().strftime("%Y-%m-%d")
-        db.cursor.execute("SELECT COUNT(*) FROM players WHERE registration_date >= %s", (today,))
+        db.cursor.execute("SELECT COUNT(*) FROM players WHERE user_id > 0 AND registration_date >= %s", (today,))
         new_users_today = db.cursor.fetchone()[0]
 
         db.cursor.execute("SELECT COUNT(*) FROM fc_lobbies WHERE status = 'finished'")
@@ -788,7 +788,7 @@ async def confirm_broadcast(callback_query: types.CallbackQuery, state: FSMConte
 
     await callback_query.message.edit_text("🔄 Начинаю рассылку...")
 
-    db.cursor.execute("SELECT user_id FROM players")
+    db.cursor.execute("SELECT user_id FROM players WHERE user_id > 0")
     users = db.cursor.fetchall()
 
     total_users = len(users)
@@ -1542,7 +1542,7 @@ async def edit_profile_menu(callback_query: types.CallbackQuery):
     await cleanup_user_messages(uid)
     await send_message_with_image(
         uid,
-        f"{pe('✏️')} Редактирование профиля\n\nВыберите действие:",
+        f"{pe('✏️')} Редактирование профиля",
         None,
         get_edit_profile_keyboard(),
     )
@@ -1604,7 +1604,7 @@ async def cancel_edit_profile(callback_query: types.CallbackQuery, state: FSMCon
     await cleanup_user_messages(uid)
     await send_message_with_image(
         uid,
-        f"{pe('✏️')} Редактирование профиля\n\nВыберите действие:",
+        f"{pe('✏️')} Редактирование профиля",
         None,
         get_edit_profile_keyboard(),
     )
@@ -1671,7 +1671,7 @@ async def back_to_main(callback_query: types.CallbackQuery, state: FSMContext):
     await cleanup_user_messages(user_id)
     await cleanup_lobby_messages(user_id)
 
-    menu_text = f"{pe('👋')} Привет, {esc(first_name)}!\n\nВыберите действие:"
+    menu_text = f"{pe('👋')} Привет, {esc(first_name)}!"
     await send_message_with_image(user_id, menu_text, MENU_IMAGE_URL, get_main_keyboard(user_id))
     await callback_query.answer()
 
@@ -2225,6 +2225,21 @@ FC_MAPS = [
 ]
 FC_SIDES = {"ct": "🔵 CT", "t": "🟠 T"}
 
+# Визуальные боты — игроки для проверки в одиночку (кнопки «🤖» в лобби). На релизе: FC_VISUAL_BOTS=false
+FC_VISUAL_BOTS = os.getenv('FC_VISUAL_BOTS', 'true').strip().lower() in ('true', '1', 'yes', 'on')
+_BOT_NAMES = ["Shadow", "Viper", "Raven", "Blaze", "Ghost", "Falcon", "Nova", "Rogue", "Titan", "Cobra", "Echo", "Wolf"]
+_BOT_ELO = [420, 150, 610, 90, 300, 520, 210, 700, 60, 380, 260, 480]
+_BOT_KILLS = [180, 60, 260, 40, 120, 210, 90, 300, 25, 150, 100, 190]
+_BOT_DEATHS = [150, 100, 140, 80, 110, 160, 130, 170, 60, 140, 120, 150]
+FC_BOT_ROSTER = [
+    (-(i + 1), f"🤖 {name}", f"BOT{i + 1:04d}", _BOT_ELO[i], _BOT_KILLS[i], _BOT_DEATHS[i])
+    for i, name in enumerate(_BOT_NAMES)
+]
+
+
+def is_bot_player(user_id):
+    return user_id is not None and user_id < 0
+
 FC_MIN_OPEN_LOBBIES = max(3, _env_int('FC_MIN_OPEN_LOBBIES', 3))   # минимум открытых лобби на каждый режим
 ELO_WIN = _env_int('ELO_WIN', 25)                 # ELO за победу
 ELO_LOSS = _env_int('ELO_LOSS', 20)               # ELO за поражение (ниже 0 не опускается)
@@ -2263,7 +2278,7 @@ def choose_captains(players):
     Возвращает (сильнейший_капитан, второй_капитан)."""
     ranked = sorted(
         players,
-        key=lambda p: (p["premium"], player_kd(p), p["elo"], random.random()),
+        key=lambda p: (not is_bot_player(p["user_id"]), p["premium"], player_kd(p), p["elo"], random.random()),
         reverse=True,
     )
     return ranked[0], ranked[1]
@@ -2355,13 +2370,19 @@ def render_lobby(lobby_id, user_id):
             lines.append(f"{i}. {get_player_level(p['elo'])} {display_nickname(p['user_id'], p['nickname'])} — {p['elo']} ELO")
         for i in range(len(players) + 1, capacity + 1):
             lines.append(f"{i}. —")
-        lines += ["", "После заполнения лобби капитаны по очереди выберут игроков в команды, а затем забанят карты."]
         if me:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
+            rows = []
+            if FC_VISUAL_BOTS and len(players) < capacity:
+                rows.append([
+                    InlineKeyboardButton(text="🤖 +1 бот", callback_data=f"fcbot_{lobby_id}"),
+                    InlineKeyboardButton(text="🤖 Заполнить ботами", callback_data=f"fcbotall_{lobby_id}"),
+                ])
+            rows += [
                 [btn("🚪 Выйти из лобби", callback_data=f"fcleave_{lobby_id}", icon="🚪")],
                 [btn("🔄 Обновить", callback_data=f"fcview_{lobby_id}", icon="🔄")],
                 [btn("◀️ В меню", callback_data="back_to_main", icon="◀️")],
-            ])
+            ]
+            kb = InlineKeyboardMarkup(inline_keyboard=rows)
         else:
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [btn("✅ Присоединиться", callback_data=f"fcjoin_{lobby_id}", icon="✅")],
@@ -2386,9 +2407,9 @@ def render_lobby(lobby_id, user_id):
         ]
         if turn_cap:
             lines.append(f"{pe('⏳')} Выбирает: <b>{display_nickname(turn_cap['user_id'], turn_cap['nickname'])}</b> ({FC_SIDES[turn]})")
-        lines.append(f"Осталось выбрать: {len(free)}  ·  на ход даётся {PICK_TIMEOUT_SEC} сек.")
+        lines.append(f"Осталось выбрать: {len(free)}")
         if me and me["is_captain"] and turn_cap and turn_cap["user_id"] == user_id:
-            lines.append(f"\n{pe('👉')} <b>Ваш ход — нажмите на игрока:</b>")
+            lines.append(f"{pe('👉')} <b>Ваш ход</b>")
         rows, row = [], []
         for p in sorted(free, key=lambda x: (-player_kd(x), -x["elo"])):
             row.append(InlineKeyboardButton(
@@ -2414,17 +2435,15 @@ def render_lobby(lobby_id, user_id):
             f"{FC_SIDES['ct']}: " + (", ".join(p['nickname'] for p in players if p['team'] == 'ct') or "—"),
             f"{FC_SIDES['t']}: " + (", ".join(p['nickname'] for p in players if p['team'] == 't') or "—"),
             "",
-            "Капитаны по очереди банят карты. Последняя оставшаяся карта будет сыграна.",
         ]
         if turn_cap:
-            lines.append(f"\n{pe('⏳')} Банит: <b>{display_nickname(turn_cap['user_id'], turn_cap['nickname'])}</b> ({FC_SIDES[turn]})")
-        lines.append(f"Забанено: {len(bans)} из {len(FC_MAPS) - 1}  ·  на ход даётся {PICK_TIMEOUT_SEC} сек.")
-        if len(bans) == len(FC_MAPS) - 2:
-            lines.append(f"{pe('⚠️')} Осталось две карты: та, которую вы забаните, играться НЕ будет — сыграют оставшуюся.")
+            lines.append(f"{pe('⏳')} Банит: <b>{display_nickname(turn_cap['user_id'], turn_cap['nickname'])}</b> ({FC_SIDES[turn]})")
         if bans:
             lines.append("Баны: " + " · ".join(f"{i}. {name} ({FC_SIDES.get(team, '')})" for i, (team, name) in enumerate(bans, 1)))
+        if len(bans) == len(FC_MAPS) - 2:
+            lines.append(f"{pe('⚠️')} Последний бан: забаненная карта НЕ будет сыграна")
         if me and me["is_captain"] and turn_cap and turn_cap["user_id"] == user_id:
-            lines.append(f"\n{pe('👉')} <b>Ваш ход — нажмите на карту, которую хотите забанить:</b>")
+            lines.append(f"{pe('👉')} <b>Ваш ход</b>")
         rows, row = [], []
         for i, name in enumerate(FC_MAPS):
             row.append(map_button(lobby_id, i, name, name in banned_names))
@@ -2447,11 +2466,9 @@ def render_lobby(lobby_id, user_id):
             lines.append(f"{pe('👑')} Хост: {display_nickname(host['user_id'], host['nickname'])} | ID: <code>{esc(host['game_id'])}</code>")
         if my_side:
             lines.append(f"Ваша сторона: <b>{my_side}</b>" + (" · 👑 капитан" if me and me["is_captain"] else ""))
-        lines += ["", FC_SIDES["ct"], *team_block(players, "ct"), "", FC_SIDES["t"], *team_block(players, "t"), "",
-                  "Хост создаёт комнату в игре, остальные заходят по его ID.",
-                  f"{pe('📸')} После матча капитан отправляет скриншот результата — модераторы начислят ELO."]
+        lines += ["", FC_SIDES["ct"], *team_block(players, "ct"), "", FC_SIDES["t"], *team_block(players, "t")]
         if me and me["is_captain"] and db.kv_get(f"fcshot:{lobby_id}:{user_id}"):
-            lines.append(f"{pe('✅')} Скриншот отправлен модераторам — ожидайте начисления ELO.")
+            lines += ["", f"{pe('✅')} Скриншот отправлен модераторам"]
         rows = []
         if me and me["is_captain"]:
             rows.append([btn("📸 Отправить результат", callback_data=f"fcshot_{lobby_id}", icon="📸")])
@@ -2486,6 +2503,8 @@ async def _push_once(user_id, text, kb, force_new):
 
 async def push_lobby_view(lobby_id, user_id, force_new=False):
     """Обновляет (или отправляет) игроку единственное сообщение с лобби/матчем."""
+    if is_bot_player(user_id):
+        return True
     if force_new:
         await drop_lobby_message(user_id)
     text, kb = render_lobby(lobby_id, user_id)
@@ -2516,6 +2535,20 @@ async def refresh_lobby_for_all(lobby_id, force_new=False, new_for=()):
         await push_lobby_view(lobby_id, p["user_id"], force_new=force_new or p["user_id"] in new_for)
 
 
+async def maybe_play_bot_turn(lobby_id):
+    """Если очередь капитана-бота — он сразу выбирает игрока / банит карту."""
+    lobby = db.fc_get_lobby(lobby_id)
+    if not lobby or lobby[4] not in ("draft", "veto") or not lobby[7]:
+        return
+    captain_id = lobby[5] if lobby[7] == "ct" else lobby[6]
+    if not is_bot_player(captain_id):
+        return
+    if lobby[4] == "draft":
+        await auto_pick(lobby_id)
+    else:
+        await auto_ban(lobby_id)
+
+
 async def refresh_turn(lobby_id):
     """Ход перешёл к другому капитану: ему приходит новое сообщение, остальным оно обновляется на месте."""
     lobby = db.fc_get_lobby(lobby_id)
@@ -2524,6 +2557,7 @@ async def refresh_turn(lobby_id):
         return
     captain_id = lobby[5] if lobby[7] == "ct" else lobby[6]
     await refresh_lobby_for_all(lobby_id, new_for={captain_id})
+    await maybe_play_bot_turn(lobby_id)
 
 
 async def open_lobby_for_user(user_id, lobby_id):
@@ -2558,7 +2592,7 @@ async def fc_find(callback_query: types.CallbackQuery):
         ],
         [btn("◀️ Назад", callback_data="back_to_main", icon="◀️")],
     ])
-    await send_message_with_image(user_id, f"{pe('🎮')} <b>Найти матч</b>\n\nВыберите режим:", None, kb)
+    await send_message_with_image(user_id, f"{pe('🎮')} <b>Найти матч</b> — выберите режим", None, kb)
     await callback_query.answer()
 
 
@@ -2646,8 +2680,7 @@ async def fc_join_confirm(callback_query: types.CallbackQuery):
     text = (
         f"{pe('❓')} <b>Подтвердите вход в лобби</b>\n\n"
         f"{pe('🎮')} Режим: {fc_title(lobby[1])}\n"
-        f"{pe('👥')} Игроков сейчас: {count}/{lobby[2] * 2}\n\n"
-        f"После входа вы не сможете присоединиться к другому лобби, пока не выйдете или не закончится матч."
+        f"{pe('👥')} Игроков сейчас: {count}/{lobby[2] * 2}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [btn("✅ Подтвердить", callback_data=f"fcjoinok_{lobby_id}", icon="✅"),
@@ -2683,6 +2716,47 @@ async def fc_join(callback_query: types.CallbackQuery):
         await refresh_lobby_for_all(lobby_id)
 
 
+async def add_visual_bots(lobby_id, fill):
+    """Добавляет в лобби визуальных ботов: одного или сколько нужно до заполнения."""
+    db.fc_ensure_bots(FC_BOT_ROSTER)
+    added, count, capacity = 0, 0, 0
+    while True:
+        bot_id = db.fc_get_idle_bot()
+        if bot_id is None:
+            break
+        ok_join, _error, count, capacity = db.fc_join(lobby_id, bot_id)
+        if not ok_join:
+            break
+        added += 1
+        if not fill or count >= capacity:
+            break
+    return added, count, capacity
+
+
+@dp.callback_query(lambda c: c.data.startswith("fcbot_") or c.data.startswith("fcbotall_"))
+async def fc_add_bots(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    fill = callback_query.data.startswith("fcbotall_")
+    try:
+        lobby_id = int(callback_query.data.split("_")[1])
+    except (ValueError, IndexError):
+        await callback_query.answer()
+        return
+    lobby = db.fc_get_lobby(lobby_id)
+    if not FC_VISUAL_BOTS or not lobby or lobby[4] != "open" or user_id not in [p["user_id"] for p in db.fc_get_players(lobby_id)]:
+        await callback_query.answer("Боты недоступны.", show_alert=True)
+        return
+    added, count, capacity = await add_visual_bots(lobby_id, fill)
+    if not added:
+        await callback_query.answer("Свободных ботов нет или лобби уже заполнено.", show_alert=True)
+        return
+    await callback_query.answer(f"🤖 Добавлено ботов: {added}")
+    if count >= capacity:
+        await start_draft(lobby_id)
+    else:
+        await refresh_lobby_for_all(lobby_id)
+
+
 @dp.callback_query(lambda c: c.data.startswith("fcleave_"))
 async def fc_leave(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
@@ -2698,7 +2772,7 @@ async def fc_leave(callback_query: types.CallbackQuery):
     await callback_query.answer("🚪 Вы вышли из лобби")
     await safe_delete_message(chat_id=user_id, message_id=callback_query.message.message_id)
     await send_message_with_image(
-        user_id, f"{pe('👋')} Вы вышли из лобби.\n\nВыберите действие:", MENU_IMAGE_URL, get_main_keyboard(user_id)
+        user_id, f"{pe('👋')} Вы вышли из лобби", MENU_IMAGE_URL, get_main_keyboard(user_id)
     )
     await refresh_lobby_for_all(lobby_id)
 
@@ -2723,6 +2797,7 @@ async def start_draft(lobby_id):
         await start_veto(lobby_id)               # выбирать некого (режим 1 на 1) — сразу бан карт
     else:
         await refresh_lobby_for_all(lobby_id, force_new=True)
+        await maybe_play_bot_turn(lobby_id)
 
 
 async def after_pick(lobby_id, remaining, next_turn):
@@ -2842,6 +2917,7 @@ async def start_veto(lobby_id):
     if not db.fc_start_veto(lobby_id, first_ban):
         return
     await refresh_lobby_for_all(lobby_id, force_new=True)
+    await maybe_play_bot_turn(lobby_id)
 
 
 @dp.callback_query(lambda c: c.data.startswith("fcban_"))
@@ -2895,10 +2971,11 @@ async def finish_veto(lobby_id):
     lobby = db.fc_get_lobby(lobby_id)
     if not players or not lobby:
         return
-    if HOST_MODE == "captain" and lobby[5]:
+    humans = [p for p in players if not is_bot_player(p["user_id"])] or players
+    if HOST_MODE == "captain" and lobby[5] and not is_bot_player(lobby[5]):
         host_id = lobby[5]
     else:
-        host_id = random.choice(players)["user_id"]
+        host_id = random.choice(humans)["user_id"]
     if not db.fc_set_live(lobby_id, host_id, None):
         return
     thread_id = await create_match_topic(lobby_id)
@@ -3105,6 +3182,8 @@ def build_result_text(lobby_id, results, winner):
 
 async def notify_match_result(lobby_id, results):
     for r in results:
+        if is_bot_player(r["user_id"]):
+            continue
         await drop_lobby_message(r["user_id"])
         await cleanup_user_messages(r["user_id"])
         kd = f"\n{pe('🎯')} K/D матча: {r['kills']}/{r['deaths']}" if (r["kills"] or r["deaths"]) else ""
@@ -3113,7 +3192,7 @@ async def notify_match_result(lobby_id, results):
             f"{pe('🏆') if r['won'] else pe('❌')} {'Победа!' if r['won'] else 'Поражение'}\n"
             f"{pe('📈')} ELO: {r['elo_before']} → <b>{r['elo_after']}</b> ({r['elo_delta']:+d})"
             f"{' · ×1.5 Premium' if r['won'] and r['premium'] else ''}"
-            f"{kd}\n{pe('📈')} Уровень: {get_player_level(r['elo_after'])}"
+            f"{kd}"
         )
         try:
             await send_message_with_image(r["user_id"], text, None, get_main_keyboard(r["user_id"]))
@@ -3126,7 +3205,7 @@ async def post_match_to_channel(lobby_id, results):
     if not CHANNEL_ID:
         return
     lobby = db.fc_get_lobby(lobby_id)
-    top = sorted(results, key=lambda r: (r["kills"], r["elo_delta"]), reverse=True)[:3]
+    top = sorted([r for r in results if not is_bot_player(r["user_id"])], key=lambda r: (r["kills"], r["elo_delta"]), reverse=True)[:3]
     medals = [pe("🥇"), pe("🥈"), "🥉"]
     lines = [
         f"{pe('🏁')} Матч #{lobby_id} завершён",
@@ -3220,6 +3299,8 @@ async def fc_cancel_match(callback_query: types.CallbackQuery):
     except Exception:
         pass
     for p in players:
+        if is_bot_player(p["user_id"]):
+            continue
         await drop_lobby_message(p["user_id"])
         await cleanup_user_messages(p["user_id"])
         try:
@@ -3506,14 +3587,14 @@ async def begin_ticket(user_id, state):
     """Шаг 1: выбор матча из последних трёх."""
     await state.clear()
     if not db.is_user_registered(user_id):
-        await ticket_notice(user_id, f"{pe('❌')} Сначала зарегистрируйтесь через /start.", fc_back_keyboard())
+        await ticket_notice(user_id, f"{pe('❌')} Сначала зарегистрируйтесь: /start", fc_back_keyboard())
         return
     if db.fc_count_recent_tickets(user_id) >= TICKET_DAILY_LIMIT:
-        await ticket_notice(user_id, f"{pe('❌')} Лимит тикетов на сегодня исчерпан ({TICKET_DAILY_LIMIT}). Попробуйте завтра.", fc_back_keyboard())
+        await ticket_notice(user_id, f"{pe('❌')} Лимит тикетов на сегодня исчерпан ({TICKET_DAILY_LIMIT})", fc_back_keyboard())
         return
     matches = db.fc_recent_matches(user_id, 3)
     if not matches:
-        await ticket_notice(user_id, f"{pe('❌')} У вас пока нет матчей, по которым можно подать тикет.", fc_back_keyboard())
+        await ticket_notice(user_id, f"{pe('❌')} Нет матчей, по которым можно подать тикет", fc_back_keyboard())
         return
     rows = [
         [InlineKeyboardButton(text=f"#{lobby_id} · {fc_title(mode)} · {map_name or '—'}", callback_data=f"ticket_m_{lobby_id}")]
@@ -3521,8 +3602,7 @@ async def begin_ticket(user_id, state):
     ]
     rows.append([btn("❌ Отмена", callback_data="ticket_cancel", icon="❌")])
     text = (
-        f"{pe('🎫')} <b>Тикет · шаг 1 из 4</b>\n\n"
-        f"Выберите матч, в котором произошло нарушение (последние три):"
+        f"{pe('🎫')} <b>Тикет · шаг 1 из 4</b> — выберите матч"
     )
     await ticket_notice(user_id, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -3546,7 +3626,7 @@ async def ticket_start(callback_query: types.CallbackQuery, state: FSMContext):
 async def ticket_cancel(callback_query: types.CallbackQuery, state: FSMContext):
     await state.clear()
     user_id = callback_query.from_user.id
-    await ticket_notice(user_id, f"{pe('👋')} Тикет отменён.\n\nВыберите действие:", get_main_keyboard(user_id))
+    await ticket_notice(user_id, f"{pe('👋')} Тикет отменён", get_main_keyboard(user_id))
     await callback_query.answer("Отменено")
 
 
@@ -3554,7 +3634,7 @@ def player_buttons_keyboard(lobby_id, user_id):
     """Кнопки со всеми игроками матча (кроме самого заявителя), с отметкой стороны."""
     rows, row = [], []
     for p in db.fc_get_players(lobby_id):
-        if p["user_id"] == user_id:
+        if p["user_id"] == user_id or is_bot_player(p["user_id"]):
             continue
         side = "🔵" if p["team"] == "ct" else ("🟠" if p["team"] == "t" else "▫️")
         row.append(InlineKeyboardButton(text=f"{side} {p['nickname']}", callback_data=f"ticket_p_{lobby_id}_{p['user_id']}"))
@@ -3589,9 +3669,7 @@ async def ticket_pick_match(callback_query: types.CallbackQuery, state: FSMConte
     await state.set_state(TicketStates.waiting_for_accused)
     await state.update_data(ticket_lobby=lobby_id)
     text = (
-        f"{pe('🎫')} <b>Тикет · шаг 2 из 4</b>\n\n"
-        f"Матч #{lobby_id}.\n"
-        f"Выберите игрока, на которого вы подаёте жалобу:"
+        f"{pe('🎫')} <b>Тикет · шаг 2 из 4</b> — матч #{lobby_id}: выберите игрока"
     )
     await ticket_notice(user_id, text, player_buttons_keyboard(lobby_id, user_id))
     await callback_query.answer()
@@ -3611,15 +3689,14 @@ async def ticket_pick_player(callback_query: types.CallbackQuery, state: FSMCont
         await callback_query.answer("Этот матч недоступен для тикета.", show_alert=True)
         return
     accused = next((p for p in db.fc_get_players(lobby_id) if p["user_id"] == accused_id), None)
-    if not accused or accused_id == user_id:
+    if not accused or accused_id == user_id or is_bot_player(accused_id):
         await callback_query.answer("Этого игрока нет в матче.", show_alert=True)
         return
     await state.set_state(TicketStates.waiting_for_reason)
     await state.update_data(ticket_lobby=lobby_id, ticket_accused=accused_id)
     text = (
-        f"{pe('🎫')} <b>Тикет · шаг 3 из 4</b>\n\n"
-        f"Матч #{lobby_id}, игрок: <b>{esc(accused['nickname'])}</b>.\n"
-        f"Опишите суть нарушения своими словами (от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов):"
+        f"{pe('🎫')} <b>Тикет · шаг 3 из 4</b> — <b>{esc(accused['nickname'])}</b>\n"
+        f"Опишите нарушение (от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов):"
     )
     await ticket_notice(user_id, text, reason_keyboard(lobby_id))
     await callback_query.answer()
@@ -3646,15 +3723,14 @@ async def ticket_reason(message: types.Message, state: FSMContext):
     if len(reason) < TICKET_REASON_MIN or len(reason) > TICKET_REASON_MAX:
         await ticket_notice(
             user_id,
-            f"{pe('❌')} Опишите нарушение текстом от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов (сейчас {len(reason)}).",
+            f"{pe('❌')} Нужно от {TICKET_REASON_MIN} до {TICKET_REASON_MAX} символов (сейчас {len(reason)})",
             reason_keyboard(data.get("ticket_lobby", 0)),
         )
         return
     await state.update_data(ticket_reason=reason)
     await state.set_state(TicketStates.waiting_for_screenshot)
     text = (
-        f"{pe('🎫')} <b>Тикет · шаг 4 из 4</b>\n\n"
-        f"Отправьте скриншот нарушения <b>одним фото</b> (как фото, а не файлом)."
+        f"{pe('🎫')} <b>Тикет · шаг 4 из 4</b> — отправьте скриншот <b>одним фото</b>"
     )
     await ticket_notice(user_id, text, ticket_cancel_keyboard())
 
@@ -3719,7 +3795,7 @@ async def ticket_screenshot(message: types.Message, state: FSMContext):
             await message.delete()
         except Exception:
             pass
-        await ticket_notice(user_id, f"{pe('❌')} Нужен скриншот именно фотографией. Отправьте одно фото.", ticket_cancel_keyboard())
+        await ticket_notice(user_id, f"{pe('❌')} Нужен скриншот фотографией", ticket_cancel_keyboard())
         return
     data = await state.get_data()
     lobby_id, accused_id, reason = data.get("ticket_lobby"), data.get("ticket_accused"), data.get("ticket_reason")
@@ -3764,7 +3840,7 @@ async def ticket_screenshot(message: types.Message, state: FSMContext):
     await state.clear()
     await ticket_notice(
         user_id,
-        f"{pe('✅')} Тикет #{ticket_number(ticket_id)} отправлен модераторам. Мы сообщим, когда его возьмут в работу.",
+        f"{pe('✅')} Тикет #{ticket_number(ticket_id)} отправлен модераторам",
         get_main_keyboard(user_id),
     )
 
@@ -3927,8 +4003,7 @@ async def ask_nickname(user_id, error=None):
     await cleanup_user_messages(user_id)
     text = (
         f"{pe('📝')} <b>Регистрация · шаг 1 из 4</b>\n\n"
-        f"Введите ваш игровой никнейм.\n"
-        f"Допустимо: латиница, цифры и «_», от 3 до 16 символов."
+        f"Введите игровой никнейм (3–16 символов: латиница, цифры, _)"
     )
     if error:
         text = f"{pe('❌')} {error}\n\n" + text
@@ -3940,8 +4015,7 @@ async def ask_game_id(user_id, nickname, error=None):
     text = (
         f"{pe('📝')} <b>Регистрация · шаг 2 из 4</b>\n\n"
         f"Ник: <b>{esc(nickname)}</b>\n\n"
-        f"Введите ваш игровой ID (из Standoff 2).\n"
-        f"Допустимо: латиница и цифры, от 3 до 20 символов."
+        f"Введите игровой ID (3–20 символов: латиница, цифры)"
     )
     if error:
         text = f"{pe('❌')} {error}\n\n" + text
@@ -3952,8 +4026,7 @@ async def ask_device(user_id):
     await cleanup_user_messages(user_id)
     text = (
         f"{pe('📝')} <b>Регистрация · шаг 3 из 4</b>\n\n"
-        f"На каком устройстве вы играете?\n"
-        f"Это просто отметка в профиле, на подбор лобби не влияет."
+        f"Выберите ваше устройство:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -4127,9 +4200,8 @@ async def reg_confirm(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer("✅ Регистрация завершена")
     await cleanup_user_messages(user_id)
     text = (
-        f"{pe('✅')} Регистрация завершена!\n\n"
-        f"{pe('👋')} Добро пожаловать, <b>{esc(nickname)}</b>!\n\n"
-        f"Выберите действие:"
+        f"{pe('✅')} Регистрация завершена!\n"
+        f"{pe('👋')} Добро пожаловать, <b>{esc(nickname)}</b>!"
     )
     await send_message_with_image(user_id, text, MENU_IMAGE_URL, get_main_keyboard(user_id))
 
@@ -4397,7 +4469,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         nickname = profile[2] if profile else first_name
         await send_message_with_image(
             user_id,
-            f"{pe('👋')} Привет, <b>{esc(nickname)}</b>!\n\nВыберите действие:",
+            f"{pe('👋')} Привет, <b>{esc(nickname)}</b>!",
             MENU_IMAGE_URL,
             get_main_keyboard(user_id),
         )
