@@ -1350,13 +1350,6 @@ class Database:
             results = []
             for p in players:
                 won = p["team"] == winner
-                if p["user_id"] < 0:   # визуальные боты: статистику не меняем
-                    c.execute(
-                        "UPDATE fc_lobby_players SET elo_before = %s, elo_delta = 0 WHERE lobby_id = %s AND user_id = %s",
-                        (p["elo"], lobby_id, p["user_id"]),
-                    )
-                    results.append({**p, "won": won, "elo_before": p["elo"], "elo_after": p["elo"], "elo_delta": 0})
-                    continue
                 if won:
                     delta = int(round(elo_win * (premium_mult if p["premium"] else 1)))
                 else:
@@ -1653,48 +1646,32 @@ class Database:
             self.conn.rollback()
             return None
 
-    # ---------- визуальные боты (для проверки лобби в одиночку) ----------
-    def fc_ensure_bots(self, bots):
-        """bots: [(user_id<0, nickname, game_id, elo, kills, deaths)]. Создаёт тех, кого ещё нет."""
+    # ---------- разовая очистка: удаление ранее добавленных тестовых ботов ----------
+    def fc_purge_bots(self):
+        """Удаляет тестовых ботов (отрицательные id) из базы. Возвращает, сколько ботов удалено."""
         try:
             self.ensure_connection()
-            for uid, nickname, game_id, elo, kills, deaths in bots:
-                self.cursor.execute("SELECT 1 FROM players WHERE user_id = %s", (uid,))
-                if self.cursor.fetchone():
-                    continue
-                self.cursor.execute(
-                    "INSERT INTO players (user_id, username, nickname, game_id, registration_date) VALUES (%s, NULL, %s, %s, %s)",
-                    (uid, nickname, game_id, self._now_str()),
-                )
-                self.cursor.execute(
-                    "INSERT INTO player_stats (user_id, rating, matches_played, kills, deaths) VALUES (%s, %s, 0, %s, %s)",
-                    (uid, elo, kills, deaths),
-                )
-            self.conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Error creating visual bots: {e}")
-            self.conn.rollback()
-            return False
-
-    def fc_get_idle_bot(self):
-        """id бота, который сейчас не участвует ни в одном лобби/матче, либо None."""
-        try:
-            self.ensure_connection()
-            self.cursor.execute(
-                """SELECT p.user_id FROM players p
-                   WHERE p.user_id < 0 AND NOT EXISTS (
-                       SELECT 1 FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
-                       WHERE lp.user_id = p.user_id AND l.status IN ('open', 'draft', 'veto', 'live'))
-                   ORDER BY p.user_id DESC LIMIT 1"""
+            c = self.cursor
+            c.execute("SELECT COUNT(*) FROM players WHERE user_id < 0")
+            count = c.fetchone()[0]
+            if not count:
+                self.conn.commit()
+                return 0
+            c.execute(
+                """UPDATE fc_lobbies SET status = 'cancelled', finished_at = %s
+                   WHERE status IN ('draft', 'veto', 'live')
+                     AND id IN (SELECT lobby_id FROM fc_lobby_players WHERE user_id < 0)""",
+                (self._now_str(),),
             )
-            row = self.cursor.fetchone()
+            c.execute("DELETE FROM fc_lobby_players WHERE user_id < 0")
+            c.execute("DELETE FROM player_stats WHERE user_id < 0")
+            c.execute("DELETE FROM players WHERE user_id < 0")
             self.conn.commit()
-            return row[0] if row else None
+            return count
         except Exception as e:
-            logger.error(f"Error getting idle bot: {e}")
+            logger.error(f"Error purging bots: {e}")
             self.conn.rollback()
-            return None
+            return 0
 
     def create_indexes(self):
         try:
