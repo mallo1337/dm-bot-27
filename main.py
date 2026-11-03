@@ -665,7 +665,14 @@ async def set_bot_commands_for_user(user_id):
         commands.extend([
             types.BotCommand(command="post", description="📢 Рассылка"),
             types.BotCommand(command="botstat", description="📊 Статистика бота"),
-            types.BotCommand(command="kd", description="🎯 Внести K/D игроков матча")
+            types.BotCommand(command="kd", description="🎯 Внести K/D игроков матча"),
+            types.BotCommand(command="mute", description="🔇 Выдать мут"),
+            types.BotCommand(command="unmute", description="🔊 Снять мут"),
+            types.BotCommand(command="ban", description="⛔️ Заблокировать игрока"),
+            types.BotCommand(command="unban", description="✅ Снять бан"),
+            types.BotCommand(command="warn", description="⚠️ Выдать варн"),
+            types.BotCommand(command="unwarn", description="♻️ Сбросить варны"),
+            types.BotCommand(command="pinfo", description="📋 Наказания игрока")
         ])
 
     if is_owner(user_id):
@@ -1670,6 +1677,8 @@ async def back_to_main(callback_query: types.CallbackQuery, state: FSMContext):
 
     await cleanup_user_messages(user_id)
     await cleanup_lobby_messages(user_id)
+    await drop_lobby_message(user_id)
+    await drop_party_message(user_id)
 
     menu_text = f"{pe('👋')} Привет, {esc(first_name)}!"
     await send_message_with_image(user_id, menu_text, MENU_IMAGE_URL, get_main_keyboard(user_id))
@@ -2358,7 +2367,6 @@ def render_lobby(lobby_id, user_id):
         if me:
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [btn("🚪 Выйти из лобби", callback_data=f"fcleave_{lobby_id}", icon="🚪")],
-                [btn("🔄 Обновить", callback_data=f"fcview_{lobby_id}", icon="🔄")],
                 [btn("◀️ В меню", callback_data="back_to_main", icon="◀️")],
             ])
         else:
@@ -2399,7 +2407,6 @@ def render_lobby(lobby_id, user_id):
                 row = []
         if row:
             rows.append(row)
-        rows.append([btn("🔄 Обновить", callback_data=f"fcview_{lobby_id}", icon="🔄")])
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
     if status == "veto":
@@ -2430,7 +2437,6 @@ def render_lobby(lobby_id, user_id):
                 row = []
         if row:
             rows.append(row)
-        rows.append([btn("🔄 Обновить", callback_data=f"fcview_{lobby_id}", icon="🔄")])
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
     if status == "live":
@@ -2450,7 +2456,6 @@ def render_lobby(lobby_id, user_id):
         rows = []
         if me and me["is_captain"]:
             rows.append([btn("📸 Отправить результат", callback_data=f"fcshot_{lobby_id}", icon="📸")])
-        rows.append([btn("🔄 Обновить", callback_data=f"fcview_{lobby_id}", icon="🔄")])
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
     if status == "finished":
@@ -2532,6 +2537,22 @@ async def open_lobby_for_user(user_id, lobby_id):
 
 
 # ---------- вход в лобби ----------
+def search_denied_text(user_id):
+    """Почему игрок не может начать поиск матча (мут / он не капитан пати / в пати кто-то в муте) либо None."""
+    muted = mute_alert_text(user_id)
+    if muted:
+        return muted
+    party_id = db.fc_get_user_party(user_id)
+    party = db.fc_get_party(party_id) if party_id else None
+    if party and party[1] != user_id:
+        return "Поиск матча запускает капитан пати"
+    if party:
+        for member in db.fc_get_party_members(party_id):
+            if member["user_id"] != user_id and mute_alert_text(member["user_id"]):
+                return f"🔇 {member['nickname']} в муте — пати не может начать поиск"
+    return None
+
+
 @dp.callback_query(lambda c: c.data == "fcfind")
 async def fc_find(callback_query: types.CallbackQuery):
     """«Найти матч»: выбор режима 2 на 2 / 5 на 5 (или возврат в текущее лобби/матч)."""
@@ -2543,6 +2564,10 @@ async def fc_find(callback_query: types.CallbackQuery):
     if active:
         await open_lobby_for_user(user_id, active)
         await callback_query.answer()
+        return
+    denied = search_denied_text(user_id)
+    if denied:
+        await callback_query.answer(denied[:190], show_alert=True)
         return
     await ensure_open_lobbies()
     await cleanup_user_messages(user_id)
@@ -2568,6 +2593,10 @@ async def fc_mode(callback_query: types.CallbackQuery):
     if active:
         await open_lobby_for_user(user_id, active)
         await callback_query.answer()
+        return
+    denied = search_denied_text(user_id)
+    if denied:
+        await callback_query.answer(denied[:190], show_alert=True)
         return
     await ensure_open_lobbies()
     await cleanup_user_messages(user_id)
@@ -2637,11 +2666,21 @@ async def fc_join_confirm(callback_query: types.CallbackQuery):
     if db.fc_get_user_active_lobby(user_id):
         await callback_query.answer("Вы уже участвуете в другом лобби или матче.", show_alert=True)
         return
+    denied = search_denied_text(user_id)
+    if denied:
+        await callback_query.answer(denied[:190], show_alert=True)
+        return
     count = len(db.fc_get_players(lobby_id))
+    party_id = db.fc_get_user_party(user_id)
+    party_size = len(db.fc_get_party_members(party_id)) if party_id else 1
+    if count + party_size > lobby[2] * 2:
+        await callback_query.answer("В лобби не хватает мест для всей пати.", show_alert=True)
+        return
     text = (
         f"{pe('❓')} <b>Подтвердите вход в лобби</b>\n\n"
         f"{pe('🎮')} Режим: {fc_title(lobby[1])}\n"
         f"{pe('👥')} Игроков сейчас: {count}/{lobby[2] * 2}"
+        + (f"\n{pe('👥')} Заходит вся пати: {party_size}" if party_size > 1 else "")
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [btn("✅ Подтвердить", callback_data=f"fcjoinok_{lobby_id}", icon="✅"),
@@ -2665,16 +2704,29 @@ async def fc_join(callback_query: types.CallbackQuery):
     if not db.is_user_registered(user_id):
         await callback_query.answer("❌ Сначала зарегистрируйтесь.", show_alert=True)
         return
-    ok, error, count, capacity = db.fc_join(lobby_id, user_id)
+    denied = search_denied_text(user_id)
+    if denied:
+        await callback_query.answer(denied[:190], show_alert=True)
+        return
+    party_id = db.fc_get_user_party(user_id)
+    party_ids = [m["user_id"] for m in db.fc_get_party_members(party_id)] if party_id else [user_id]
+    if len(party_ids) > 1:
+        ok, error, count, capacity = db.fc_join_many(lobby_id, party_ids)
+    else:
+        ok, error, count, capacity = db.fc_join(lobby_id, user_id)
     if not ok:
         await callback_query.answer(f"❌ {error}", show_alert=True)
         return
     db.kv_set(f"fcmsg:{user_id}", callback_query.message.message_id)
-    await callback_query.answer("✅ Вы в лобби")
+    others = {uid for uid in party_ids if uid != user_id}
+    for uid in others:                               # у участников пати остаётся одно сообщение — лобби
+        await drop_party_message(uid)
+        await cleanup_user_messages(uid)
+    await callback_query.answer("✅ Вы в лобби" if not others else "✅ Пати в лобби")
     if count >= capacity:
         await start_draft(lobby_id)
     else:
-        await refresh_lobby_for_all(lobby_id)
+        await refresh_lobby_for_all(lobby_id, new_for=others)
 
 
 @dp.callback_query(lambda c: c.data.startswith("fcleave_"))
@@ -2758,6 +2810,7 @@ async def auto_pick(lobby_id):
     free = [p for p in db.fc_get_players(lobby_id) if p["team"] is None]
     if not free:
         return
+    await warn_for_inactivity(captain_id, "Нет активности при выборе игроков")
     best = max(free, key=lambda p: (player_kd(p), p["elo"]))
     ok, _, remaining, next_turn = db.fc_pick(lobby_id, captain_id, best["user_id"])
     if ok:
@@ -2878,6 +2931,7 @@ async def auto_ban(lobby_id):
     if len(available) < 2:
         return
     captain_id = lobby[5] if lobby[7] == "ct" else lobby[6]
+    await warn_for_inactivity(captain_id, "Нет активности при бане карт")
     ok_ban, _, _, _, final_map = db.fc_ban_map(lobby_id, captain_id, random.choice(available), FC_MAPS)
     if ok_ban:
         await after_ban(lobby_id, final_map)
@@ -3895,6 +3949,686 @@ async def ticket_legacy_buttons(callback_query: types.CallbackQuery):
 
 
 # ======================================================================
+# НАКАЗАНИЯ: мут (нельзя играть в матчах) / бан (бот недоступен) / варны (3 варна = мут на 12 часов)
+# ======================================================================
+import time
+from aiogram import BaseMiddleware
+
+WARN_LIMIT = 3
+WARN_MUTE_HOURS = 12
+AUTO_WARN_ON_TIMEOUT = os.getenv('AUTO_WARN_ON_TIMEOUT', 'true').strip().lower() in ('true', '1', 'yes', 'on')
+
+_DURATION_RE = re.compile(r"^(\d{1,4})\s*(m|min|м|мин|h|ч|d|д|w|н)$", re.IGNORECASE)
+_FOREVER_WORDS = {"навсегда", "perm", "forever", "inf"}
+_MAX_PUNISH_DAYS = 3650
+_ban_cache = {}      # user_id -> (время проверки, бан или None)
+BAN_CACHE_TTL = 15
+
+
+def parse_duration(text):
+    """'30m' / '2h' / '3d' / '1w' (также м, ч, д, н) -> timedelta или None."""
+    match = _DURATION_RE.fullmatch((text or "").strip())
+    if not match:
+        return None
+    amount, unit = int(match.group(1)), match.group(2).lower()
+    if amount <= 0:
+        return None
+    if unit in ("m", "min", "м", "мин"):
+        delta = timedelta(minutes=amount)
+    elif unit in ("h", "ч"):
+        delta = timedelta(hours=amount)
+    elif unit in ("d", "д"):
+        delta = timedelta(days=amount)
+    else:
+        delta = timedelta(weeks=amount)
+    return delta if delta <= timedelta(days=_MAX_PUNISH_DAYS) else None
+
+
+def until_from(delta):
+    return (datetime.now() + delta).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def until_text(until):
+    return "навсегда" if until is None else fmt_dt(until)
+
+
+def invalidate_ban_cache(user_id):
+    _ban_cache.pop(user_id, None)
+
+
+def get_ban_cached(user_id):
+    now_ts = time.time()
+    hit = _ban_cache.get(user_id)
+    if hit and now_ts - hit[0] < BAN_CACHE_TTL:
+        ban = hit[1]
+        if ban and ban[0] and ban[0] <= datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
+            ban = None
+        return ban
+    ban = db.fc_get_active_punishment(user_id, "ban")
+    _ban_cache[user_id] = (now_ts, ban)
+    return ban
+
+
+def ban_message(ban):
+    until, reason, by_name = ban
+    return (
+        f"{pe('⛔️')} Администратор <b>{esc(by_name)}</b> заблокировал вас по причине: {esc(reason)}.\n"
+        f"Срок разблокировки: <b>{until_text(until)}</b>"
+    )
+
+
+class BanMiddleware(BaseMiddleware):
+    """Забаненный не может пользоваться ботом вообще: на любое действие приходит только сообщение о бане."""
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is None or is_admin(user.id):
+            return await handler(event, data)
+        if getattr(event, "successful_payment", None):      # уже прошедший платёж обрабатываем всегда
+            return await handler(event, data)
+        if isinstance(event, types.Message) and event.chat.type != "private":
+            return await handler(event, data)
+        ban = get_ban_cached(user.id)
+        if not ban:
+            return await handler(event, data)
+        text = ban_message(ban)
+        try:
+            if isinstance(event, types.CallbackQuery):
+                await event.answer(strip_tags(text)[:190], show_alert=True)
+            elif isinstance(event, types.Message):
+                await event.answer(text, parse_mode='HTML')
+        except Exception as e:
+            logger.warning(f"Ban notice failed for {user.id}: {e}")
+        return None
+
+
+dp.message.outer_middleware(BanMiddleware())
+dp.callback_query.outer_middleware(BanMiddleware())
+
+
+# ---------- проверки ----------
+def mute_alert_text(user_id):
+    """Текст для всплывающего окна, если игрок в муте; иначе None."""
+    mute = db.fc_get_active_punishment(user_id, "mute")
+    if not mute:
+        return None
+    until, reason, _ = mute
+    text = f"🔇 Вы в муте до {until_text(until)}"
+    if reason:
+        text += f". Причина: {reason[:70]}"
+    return text + ". Играть в матчах нельзя"
+
+
+async def deny_if_muted(callback_query):
+    """True — игрок в муте, ему уже ответили."""
+    text = mute_alert_text(callback_query.from_user.id)
+    if text:
+        await callback_query.answer(text[:190], show_alert=True)
+        return True
+    return False
+
+
+def punishment_lines(user_id):
+    """Блок «Наказания» для профиля."""
+    lines = []
+    mute = db.fc_get_active_punishment(user_id, "mute")
+    warns = db.fc_get_warns(user_id)
+    if mute:
+        lines.append(f"🔇 Мут: до {until_text(mute[0])}")
+    if warns:
+        lines.append(f"⚠️ Варны: {warns}/{WARN_LIMIT}")
+    if not lines:
+        return [f"{pe('🛡')} Наказания: нет"]
+    return [f"{pe('🛡')} <b>Наказания</b>", *lines]
+
+
+# ---------- применение наказаний ----------
+async def notify_player(user_id, text):
+    try:
+        await bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
+    except Exception as e:
+        logger.info(f"Cannot notify {user_id}: {e}")
+
+
+async def leave_open_lobby(user_id):
+    """Наказанного убираем из набирающегося лобби (из начатого матча не трогаем)."""
+    lobby_id = db.fc_get_user_active_lobby(user_id)
+    lobby = db.fc_get_lobby(lobby_id) if lobby_id else None
+    if lobby and lobby[4] == "open" and db.fc_leave(lobby_id, user_id):
+        await drop_lobby_message(user_id)
+        await refresh_lobby_for_all(lobby_id)
+
+
+async def apply_mute(target_id, delta, reason, by_id, by_name):
+    until = until_from(delta)
+    db.fc_add_punishment(target_id, "mute", until, reason, by_id, by_name)
+    await leave_open_lobby(target_id)
+    await notify_player(
+        target_id,
+        f"{pe('🔇')} Вам выдан мут до <b>{until_text(until)}</b>"
+        + (f"\nПричина: {esc(reason)}" if reason else "")
+        + "\nИграть в матчах нельзя, остальные функции бота доступны.",
+    )
+    return until
+
+
+async def apply_ban(target_id, delta, reason, by_id, by_name):
+    until = None if delta is None else until_from(delta)
+    db.fc_add_punishment(target_id, "ban", until, reason, by_id, by_name)
+    invalidate_ban_cache(target_id)
+    await leave_open_lobby(target_id)
+    party_id = db.fc_get_user_party(target_id)
+    if party_id:
+        await remove_from_party(target_id)
+    await notify_player(target_id, ban_message((until, reason, by_name)))
+    return until
+
+
+async def issue_warn(target_id, reason, by_id=None, by_name="Система"):
+    """Выдаёт варн. На 3-м варне — автоматический мут на 12 часов и сброс варнов. Возвращает (варнов, выдан_мут)."""
+    count, reached = db.fc_add_warn(target_id, WARN_LIMIT)
+    if reached:
+        until = until_from(timedelta(hours=WARN_MUTE_HOURS))
+        db.fc_add_punishment(target_id, "mute", until, f"{WARN_LIMIT} предупреждения", by_id, by_name)
+        await leave_open_lobby(target_id)
+        await notify_player(
+            target_id,
+            f"{pe('⚠️')} Предупреждение {WARN_LIMIT}/{WARN_LIMIT}: {esc(reason)}\n"
+            f"{pe('🔇')} Вам выдан мут на {WARN_MUTE_HOURS} ч. (до <b>{until_text(until)}</b>), варны сброшены.",
+        )
+        return WARN_LIMIT, True
+    await notify_player(
+        target_id,
+        f"{pe('⚠️')} Предупреждение {count}/{WARN_LIMIT}: {esc(reason)}\n"
+        f"После {WARN_LIMIT} предупреждений — мут на {WARN_MUTE_HOURS} ч.",
+    )
+    return count, False
+
+
+async def warn_for_inactivity(user_id, reason):
+    """Автоматический варн капитану, который не успел сделать выбор."""
+    if AUTO_WARN_ON_TIMEOUT and user_id and not is_admin(user_id):
+        await issue_warn(user_id, reason)
+
+
+# ---------- команды модераторов ----------
+def moderator_display_name(user):
+    profile = db.get_player_profile(user.id)
+    return profile[2] if profile else user.full_name
+
+
+def resolve_punish_target(raw):
+    """Игрок по нику / игровому ID / TG ID / @username или None."""
+    return db.find_player_id((raw or "").strip())
+
+
+async def punish_guard(message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Нет прав для этой команды.")
+        return False
+    return True
+
+
+async def get_target(message, raw):
+    target = resolve_punish_target(raw)
+    if not target:
+        await message.answer("❌ Игрок не найден (ник, игровой ID, TG ID или @username).")
+        return None
+    if is_admin(target):
+        await message.answer("❌ Нельзя наказать администратора.")
+        return None
+    return target
+
+
+@dp.message(Command("mute"))
+async def cmd_mute(message: types.Message):
+    if not await punish_guard(message):
+        return
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer("Формат: /mute ник_или_ID срок [причина]\nСрок: 30m, 2h, 3d, 1w")
+        return
+    delta = parse_duration(parts[2])
+    if not delta:
+        await message.answer("❌ Срок: число и единица: 30m, 2h, 3d, 1w (до 10 лет).")
+        return
+    target = await get_target(message, parts[1])
+    if not target:
+        return
+    reason = parts[3].strip()[:200] if len(parts) > 3 else ""
+    until = await apply_mute(target, delta, reason, message.from_user.id, moderator_display_name(message.from_user))
+    db.log_admin_action(message.from_user.id, "mute", target, f"until {until}: {reason}")
+    await message.answer(f"🔇 Мут выдан: {player_label_plain(target)} до {until_text(until)}")
+
+
+@dp.message(Command("unmute"))
+async def cmd_unmute(message: types.Message):
+    if not await punish_guard(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Формат: /unmute ник_или_ID")
+        return
+    target = await get_target(message, parts[1])
+    if not target:
+        return
+    if db.fc_remove_punishment(target, "mute"):
+        db.log_admin_action(message.from_user.id, "unmute", target, None)
+        await notify_player(target, f"{pe('✅')} Мут снят, можно играть.")
+        await message.answer(f"✅ Мут снят: {player_label_plain(target)}")
+    else:
+        await message.answer("ℹ️ У игрока нет действующего мута.")
+
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: types.Message):
+    if not await punish_guard(message):
+        return
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 4:
+        await message.answer("Формат: /ban ник_или_ID срок причина\nСрок: 3d, 1w, 12h… или «навсегда»")
+        return
+    if parts[2].lower() in _FOREVER_WORDS:
+        delta = None
+    else:
+        delta = parse_duration(parts[2])
+        if not delta:
+            await message.answer("❌ Срок: 3d, 1w, 12h… или «навсегда».")
+            return
+    target = await get_target(message, parts[1])
+    if not target:
+        return
+    reason = parts[3].strip()[:200]
+    until = await apply_ban(target, delta, reason, message.from_user.id, moderator_display_name(message.from_user))
+    db.log_admin_action(message.from_user.id, "ban", target, f"until {until_text(until)}: {reason}")
+    await message.answer(f"⛔ Бан выдан: {player_label_plain(target)} — {until_text(until)}")
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: types.Message):
+    if not await punish_guard(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Формат: /unban ник_или_ID")
+        return
+    target = resolve_punish_target(parts[1])
+    if not target:
+        await message.answer("❌ Игрок не найден.")
+        return
+    removed = db.fc_remove_punishment(target, "ban")
+    invalidate_ban_cache(target)
+    if removed:
+        db.log_admin_action(message.from_user.id, "unban", target, None)
+        await notify_player(target, f"{pe('✅')} Блокировка снята. Нажмите /start.")
+        await message.answer(f"✅ Бан снят: {player_label_plain(target)}")
+    else:
+        await message.answer("ℹ️ У игрока нет действующего бана.")
+
+
+@dp.message(Command("warn"))
+async def cmd_warn(message: types.Message):
+    if not await punish_guard(message):
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("Формат: /warn ник_или_ID [причина]")
+        return
+    target = await get_target(message, parts[1])
+    if not target:
+        return
+    reason = parts[2].strip()[:200] if len(parts) > 2 and parts[2].strip() else "Нарушение правил"
+    count, muted = await issue_warn(target, reason, message.from_user.id, moderator_display_name(message.from_user))
+    db.log_admin_action(message.from_user.id, "warn", target, reason)
+    await message.answer(
+        f"⚠️ Варн выдан: {player_label_plain(target)} — {count}/{WARN_LIMIT}"
+        + (f"\n🔇 Автоматически выдан мут на {WARN_MUTE_HOURS} ч., варны сброшены." if muted else "")
+    )
+
+
+@dp.message(Command("unwarn"))
+async def cmd_unwarn(message: types.Message):
+    if not await punish_guard(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Формат: /unwarn ник_или_ID")
+        return
+    target = resolve_punish_target(parts[1])
+    if not target:
+        await message.answer("❌ Игрок не найден.")
+        return
+    db.fc_clear_warns(target)
+    db.log_admin_action(message.from_user.id, "unwarn", target, None)
+    await message.answer(f"✅ Варны сброшены: {player_label_plain(target)}")
+
+
+@dp.message(Command("pinfo"))
+async def cmd_punishment_info(message: types.Message):
+    """Что у игрока из наказаний: /pinfo ник_или_ID"""
+    if not await punish_guard(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Формат: /pinfo ник_или_ID")
+        return
+    target = resolve_punish_target(parts[1])
+    if not target:
+        await message.answer("❌ Игрок не найден.")
+        return
+    lines = [f"📋 {player_label_plain(target)}"]
+    ban = db.fc_get_active_punishment(target, "ban")
+    mute = db.fc_get_active_punishment(target, "mute")
+    lines.append(f"⛔ Бан: до {until_text(ban[0])} — {ban[1]} ({ban[2]})" if ban else "⛔ Бан: нет")
+    lines.append(f"🔇 Мут: до {until_text(mute[0])}" + (f" — {mute[1]}" if mute[1] else "") if mute else "🔇 Мут: нет")
+    lines.append(f"⚠️ Варны: {db.fc_get_warns(target)}/{WARN_LIMIT}")
+    await message.answer("\n".join(lines))
+
+
+def player_label_plain(user_id):
+    profile = db.get_player_profile(user_id)
+    return f"{profile[2]} ({user_id})" if profile else str(user_id)
+
+
+# ======================================================================
+# ПАТИ (командная игра): капитан пати приглашает игроков и один запускает поиск матча для всех
+# ======================================================================
+PARTY_MAX_FREE = 3            # без Premium у капитана пати — до 3 игроков
+PARTY_MAX_PREMIUM = 4         # с Premium у капитана пати — до 4 игроков
+PARTY_INVITE_TTL_MIN = 10     # приглашение действует 10 минут
+
+
+class PartyStates(StatesGroup):
+    waiting_for_invitee = State()
+
+
+def party_limit(leader_id):
+    return PARTY_MAX_PREMIUM if db.is_premium(leader_id) else PARTY_MAX_FREE
+
+
+def render_party(user_id, note=None):
+    """Текст и кнопки пати для игрока. None — если игрок не в пати."""
+    party_id = db.fc_get_user_party(user_id)
+    party = db.fc_get_party(party_id) if party_id else None
+    if not party:
+        return None
+    members = db.fc_get_party_members(party_id)
+    is_leader = party[1] == user_id
+    limit = party_limit(party[1])
+    lines = [f"{pe('👥')} <b>Пати</b> · {len(members)}/{limit}", ""]
+    for m in members:
+        level = get_player_level(m["elo"])
+        name = display_nickname(m["user_id"], m["nickname"])
+        lines.append(f"{pe('👑')} {name} · {level}" if m["is_leader"] else f"{name} · {level}")
+    if is_leader:
+        if len(members) == 1:
+            lines += ["", "Пригласите друзей — поиск матча запускает капитан"]
+        elif len(members) >= PARTY_MAX_FREE and not db.is_premium(user_id) and len(members) < PARTY_MAX_PREMIUM:
+            lines += ["", f"Для {PARTY_MAX_PREMIUM} игроков нужен Premium"]
+    if note:
+        lines += ["", note]
+    if is_leader:
+        rows = [
+            [btn("➕ Пригласить игрока", callback_data="party_invite", icon="➕")],
+            [btn("🔍 Найти матч", callback_data="fcfind", icon="🔍")],
+            [
+                btn("🗑 Распустить пати", callback_data="party_disband", icon="🗑"),
+                btn("◀️ В меню", callback_data="back_to_main", icon="◀️"),
+            ],
+        ]
+    else:
+        rows = [[
+            btn("🚪 Покинуть пати", callback_data="party_leave", icon="🚪"),
+            btn("◀️ В меню", callback_data="back_to_main", icon="◀️"),
+        ]]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_party_screen(user_id, note=None):
+    rendered = render_party(user_id, note)
+    if not rendered:
+        return False
+    text, kb = rendered
+    await cleanup_user_messages(user_id)
+    message = await send_message_with_image(user_id, text, None, kb)
+    if message:
+        db.kv_set(f"partymsg:{user_id}", message.message_id)
+    return True
+
+
+async def drop_party_message(user_id):
+    old = db.kv_get(f"partymsg:{user_id}")
+    if old:
+        await safe_delete_message(chat_id=user_id, message_id=int(old))
+        db.kv_delete(f"partymsg:{user_id}")
+
+
+async def refresh_party_screens(party_id, notes=None):
+    """Обновляет экран пати на месте у всех участников. notes: {user_id: строка под списком}."""
+    for member in db.fc_get_party_members(party_id):
+        uid = member["user_id"]
+        mid = db.kv_get(f"partymsg:{uid}")
+        rendered = render_party(uid, (notes or {}).get(uid))
+        if not mid or not rendered:
+            continue
+        try:
+            await bot.edit_message_text(
+                chat_id=uid, message_id=int(mid), text=rendered[0], reply_markup=rendered[1], parse_mode='HTML'
+            )
+        except Exception as e:
+            if "not modified" not in str(e):
+                logger.info(f"Cannot refresh party screen for {uid}: {e}")
+
+
+async def to_menu_with_text(user_id, text):
+    """Игроку остаётся одно сообщение: главное меню с короткой пометкой."""
+    await drop_party_message(user_id)
+    await cleanup_user_messages(user_id)
+    await send_message_with_image(user_id, text, MENU_IMAGE_URL, get_main_keyboard(user_id))
+
+
+async def disband_party_flow(party_id, text_for_members, text_for_leader=None):
+    party = db.fc_get_party(party_id)
+    leader_id = party[1] if party else None
+    members = db.fc_disband_party(party_id)
+    for uid in members:
+        text = (text_for_leader or text_for_members) if uid == leader_id else text_for_members
+        try:
+            await to_menu_with_text(uid, text)
+        except Exception as e:
+            logger.info(f"Cannot notify {uid} about disbanded party: {e}")
+
+
+async def remove_from_party(user_id):
+    """Игрока убирают из пати (например, бан): капитан — пати распускается, участник — выходит."""
+    party_id = db.fc_get_user_party(user_id)
+    party = db.fc_get_party(party_id) if party_id else None
+    if not party:
+        return
+    if party[1] == user_id:
+        await disband_party_flow(party_id, f"{pe('👥')} Пати распущена: капитан больше недоступен")
+    elif db.fc_leave_party(user_id):
+        await refresh_party_screens(party_id)
+
+
+# ---------- открыть пати ----------
+@dp.callback_query(lambda c: c.data == "party")
+async def party_open(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    if not db.is_user_registered(user_id):
+        await callback_query.answer("❌ Сначала зарегистрируйтесь.", show_alert=True)
+        return
+    await state.clear()
+    if not db.fc_get_user_party(user_id):
+        db.fc_create_party(user_id)
+    await send_party_screen(user_id)
+    await callback_query.answer()
+
+
+# ---------- приглашение ----------
+def invite_prompt_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("◀️ Назад", callback_data="party", icon="◀️")]])
+
+
+async def ask_invitee(user_id, error=None):
+    await cleanup_user_messages(user_id)
+    text = f"{pe('👥')} Введите ник, игровой ID или TG ID игрока"
+    if error:
+        text = f"{pe('❌')} {error}\n\n" + text
+    message = await send_message_with_image(user_id, text, None, invite_prompt_keyboard())
+    if message:
+        db.kv_set(f"partymsg:{user_id}", message.message_id)
+
+
+@dp.callback_query(lambda c: c.data == "party_invite")
+async def party_invite(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    party_id = db.fc_get_user_party(user_id)
+    party = db.fc_get_party(party_id) if party_id else None
+    if not party or party[1] != user_id:
+        await callback_query.answer("Приглашать может только капитан пати.", show_alert=True)
+        return
+    limit = party_limit(user_id)
+    if len(db.fc_get_party_members(party_id)) >= limit:
+        hint = f" Для {PARTY_MAX_PREMIUM} игроков нужен Premium." if limit < PARTY_MAX_PREMIUM else ""
+        await callback_query.answer(f"Пати заполнена ({limit}/{limit}).{hint}", show_alert=True)
+        return
+    await state.set_state(PartyStates.waiting_for_invitee)
+    await ask_invitee(user_id)
+    await callback_query.answer()
+
+
+@dp.message(PartyStates.waiting_for_invitee)
+async def party_invitee_entered(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    query = (message.text or "").strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    party_id = db.fc_get_user_party(user_id)
+    party = db.fc_get_party(party_id) if party_id else None
+    if not party or party[1] != user_id:
+        await state.clear()
+        await to_menu_with_text(user_id, f"{pe('👥')} Пати недоступна")
+        return
+    target = db.find_player_id(query)
+    if not target:
+        await ask_invitee(user_id, "Игрок не найден")
+        return
+    if target == user_id:
+        await ask_invitee(user_id, "Нельзя пригласить себя")
+        return
+    if get_ban_cached(target):
+        await ask_invitee(user_id, "Игрок заблокирован")
+        return
+    invite_id, error = db.fc_create_invite(party_id, user_id, target, party_limit(user_id), PARTY_INVITE_TTL_MIN)
+    if error:
+        await ask_invitee(user_id, error.rstrip("."))
+        return
+    inviter = db.get_player_profile(user_id)
+    inviter_nick = inviter[2] if inviter else str(user_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        btn("✅ Принять", callback_data=f"pinv_ok_{invite_id}", icon="✅"),
+        btn("❌ Отклонить", callback_data=f"pinv_no_{invite_id}", icon="❌"),
+    ]])
+    target_profile = db.get_player_profile(target)
+    target_nick = target_profile[2] if target_profile else str(target)
+    try:
+        await bot.send_message(
+            chat_id=target,
+            text=f"{pe('👥')} Игрок «{esc(inviter_nick)}» приглашает вас в свою команду",
+            reply_markup=kb, parse_mode='HTML',
+        )
+    except Exception as e:
+        logger.info(f"Cannot deliver party invite to {target}: {e}")
+        db.fc_decline_invite(invite_id, target)
+        await ask_invitee(user_id, "Не удалось отправить приглашение: игрок не запускал бота")
+        return
+    await state.clear()
+    await send_party_screen(user_id, f"{pe('✅')} Приглашение отправлено: {esc(target_nick)}")
+
+
+@dp.callback_query(lambda c: c.data.startswith("pinv_ok_"))
+async def party_invite_accept(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    try:
+        invite_id = int(callback_query.data.replace("pinv_ok_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    if not db.is_user_registered(user_id):
+        await callback_query.answer("❌ Сначала зарегистрируйтесь.", show_alert=True)
+        return
+    ok_accept, error, party_id = db.fc_accept_invite(invite_id, user_id, PARTY_MAX_FREE, PARTY_MAX_PREMIUM, PARTY_INVITE_TTL_MIN)
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
+    if not ok_accept:
+        await callback_query.answer(f"❌ {error}", show_alert=True)
+        return
+    await callback_query.answer("✅ Вы в пати")
+    await send_party_screen(user_id)
+    profile = db.get_player_profile(user_id)
+    await refresh_party_screens(party_id, {m["user_id"]: f"{pe('✅')} {esc(profile[2] if profile else user_id)} вступил в пати"
+                                           for m in db.fc_get_party_members(party_id) if m["user_id"] != user_id})
+
+
+@dp.callback_query(lambda c: c.data.startswith("pinv_no_"))
+async def party_invite_decline(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    try:
+        invite_id = int(callback_query.data.replace("pinv_no_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    invite = db.fc_get_invite(invite_id)
+    declined = db.fc_decline_invite(invite_id, user_id)
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
+    await callback_query.answer("Приглашение отклонено" if declined else "Приглашение уже недействительно")
+    if declined and invite and db.fc_get_party(invite[1]):
+        profile = db.get_player_profile(user_id)
+        await refresh_party_screens(invite[1], {invite[2]: f"{pe('❌')} {esc(profile[2] if profile else user_id)} отклонил приглашение"})
+
+
+# ---------- распустить / покинуть ----------
+@dp.callback_query(lambda c: c.data == "party_disband")
+async def party_disband(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    party_id = db.fc_get_user_party(user_id)
+    party = db.fc_get_party(party_id) if party_id else None
+    if not party or party[1] != user_id:
+        await callback_query.answer("Распустить пати может только капитан.", show_alert=True)
+        return
+    await state.clear()
+    await callback_query.answer("Пати распущена")
+    await disband_party_flow(
+        party_id,
+        f"{pe('👥')} Капитан распустил пати",
+        f"{pe('👥')} Пати распущена",
+    )
+
+
+@dp.callback_query(lambda c: c.data == "party_leave")
+async def party_leave(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    party_id = db.fc_leave_party(user_id)
+    if not party_id:
+        await callback_query.answer("Вы не состоите в пати (или вы её капитан).", show_alert=True)
+        return
+    await callback_query.answer("Вы покинули пати")
+    await to_menu_with_text(user_id, f"{pe('🚪')} Вы покинули пати")
+    profile = db.get_player_profile(user_id)
+    if db.fc_get_party(party_id):
+        await refresh_party_screens(party_id, {m["user_id"]: f"{pe('🚪')} {esc(profile[2] if profile else user_id)} покинул пати"
+                                               for m in db.fc_get_party_members(party_id)})
+
+
+# ======================================================================
 # РЕГИСТРАЦИЯ (3 шага: ник → игровой ID → подтверждение), ПРОФИЛЬ, ТОП, МЕНЮ
 # ======================================================================
 NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
@@ -4161,6 +4895,8 @@ def build_profile_text(user_id):
         f"🔫 Убийства: {kills}",
         f"💀 Смерти: {deaths}",
         f"{pe('🏆')} Винрейт: {winrate}",
+        "",
+        *punishment_lines(user_id),
     ]
     return "\n".join(lines)
 
@@ -4344,7 +5080,7 @@ async def sub_check(callback_query: types.CallbackQuery, state: FSMContext):
 
 # ---------- главное меню и /start ----------
 def get_main_keyboard(user_id=None):
-    """Главное меню: большая «Найти матч», в два столбца «Профиль» и «Топ», затем большие Premium, «Промокод» и «Тикет»."""
+    """Главное меню: большая «Найти матч», дальше парами: Профиль | Топ, Premium | Пати, Промокод | Тикет."""
     in_match = bool(user_id and db.fc_get_user_active_lobby(user_id))
     find_button = (
         btn("📋 Мой матч / лобби", callback_data="fcfind", icon="📋")
@@ -4356,9 +5092,14 @@ def get_main_keyboard(user_id=None):
             btn("👤 Мой профиль", callback_data="profile", icon="👤"),
             btn("🏆 Топ игроков", callback_data="top", icon="🏆"),
         ],
-        [btn("⭐️ Premium", callback_data="premium_menu", icon="⭐️")],
-        [btn("🎟 Промокод", callback_data="promo_enter", icon="🎟")],
-        [btn("🎫 Тикет", callback_data="ticket_start", icon="🎫")],
+        [
+            btn("⭐️ Premium", callback_data="premium_menu", icon="⭐️"),
+            btn("👥 Пати", callback_data="party", icon="👥"),
+        ],
+        [
+            btn("🎟 Промокод", callback_data="promo_enter", icon="🎟"),
+            btn("🎫 Тикет", callback_data="ticket_start", icon="🎫"),
+        ],
     ])
 
 

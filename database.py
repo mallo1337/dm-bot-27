@@ -864,6 +864,50 @@ class Database:
                     handled_at TEXT
                 )
             ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fc_parties (
+                    id SERIAL PRIMARY KEY,
+                    leader_id BIGINT NOT NULL,
+                    created_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fc_party_members (
+                    party_id INTEGER NOT NULL,
+                    user_id BIGINT PRIMARY KEY,
+                    joined_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fc_party_invites (
+                    id SERIAL PRIMARY KEY,
+                    party_id INTEGER NOT NULL,
+                    from_id BIGINT NOT NULL,
+                    to_id BIGINT NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    created_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fc_punishments (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    kind TEXT NOT NULL,
+                    until TEXT,
+                    reason TEXT,
+                    by_id BIGINT,
+                    by_name TEXT,
+                    created_at TEXT,
+                    active BOOLEAN DEFAULT TRUE
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fc_warns (
+                    user_id BIGINT PRIMARY KEY,
+                    count INTEGER DEFAULT 0
+                )
+            ''')
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_fc_punish_user ON fc_punishments(user_id)")
             self.cursor.execute("ALTER TABLE fc_tickets ADD COLUMN IF NOT EXISTS taken_by BIGINT")
             self.cursor.execute("ALTER TABLE fc_tickets ADD COLUMN IF NOT EXISTS taken_at TEXT")
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_fc_lp_user ON fc_lobby_players(user_id)")
@@ -1039,6 +1083,46 @@ class Database:
             return True, None, count + 1, capacity
         except Exception as e:
             logger.error(f"Error joining fc lobby {lobby_id}/{user_id}: {e}")
+            self.conn.rollback()
+            return False, "Ошибка базы данных, попробуйте позже.", 0, 0
+
+    def fc_join_many(self, lobby_id, user_ids):
+        """Пати заходит в лобби целиком или не заходит вовсе.
+        Возвращает (ok, ошибка, игроков_теперь, вместимость)."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT status, team_size FROM fc_lobbies WHERE id = %s", (lobby_id,))
+            row = c.fetchone()
+            if not row or row[0] != "open":
+                self.conn.commit()
+                return False, "Это лобби уже недоступно.", 0, 0
+            capacity = row[1] * 2
+            for user_id in user_ids:
+                c.execute(
+                    """SELECT 1 FROM fc_lobby_players lp JOIN fc_lobbies l ON l.id = lp.lobby_id
+                       WHERE lp.user_id = %s AND l.status IN ('open', 'draft', 'veto', 'live') LIMIT 1""",
+                    (user_id,),
+                )
+                if c.fetchone():
+                    c.execute("SELECT nickname FROM players WHERE user_id = %s", (user_id,))
+                    nick = c.fetchone()
+                    self.conn.commit()
+                    return False, f"{nick[0] if nick else user_id} уже в другом лобби или матче.", 0, capacity
+            c.execute("SELECT COUNT(*) FROM fc_lobby_players WHERE lobby_id = %s", (lobby_id,))
+            count = c.fetchone()[0]
+            if count + len(user_ids) > capacity:
+                self.conn.commit()
+                return False, "В лобби не хватает мест для всей пати.", count, capacity
+            for user_id in user_ids:
+                c.execute(
+                    "INSERT INTO fc_lobby_players (lobby_id, user_id, joined_at) VALUES (%s, %s, %s)",
+                    (lobby_id, user_id, self._now_str()),
+                )
+            self.conn.commit()
+            return True, None, count + len(user_ids), capacity
+        except Exception as e:
+            logger.error(f"Error joining fc lobby {lobby_id} with party {user_ids}: {e}")
             self.conn.rollback()
             return False, "Ошибка базы данных, попробуйте позже.", 0, 0
 
@@ -1672,6 +1756,334 @@ class Database:
             logger.error(f"Error purging bots: {e}")
             self.conn.rollback()
             return 0
+
+    # ======================================================================
+    # ПАТИ (командная игра)
+    # ======================================================================
+    def fc_get_user_party(self, user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT party_id FROM fc_party_members WHERE user_id = %s", (user_id,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error getting party of {user_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_get_party(self, party_id):
+        """(id, leader_id) или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT id, leader_id FROM fc_parties WHERE id = %s", (party_id,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row
+        except Exception as e:
+            logger.error(f"Error getting party {party_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_create_party(self, leader_id):
+        """Создаёт пати с игроком-капитаном. Возвращает id пати или None, если игрок уже в пати."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT 1 FROM fc_party_members WHERE user_id = %s", (leader_id,))
+            if c.fetchone():
+                self.conn.commit()
+                return None
+            c.execute("INSERT INTO fc_parties (leader_id, created_at) VALUES (%s, %s) RETURNING id", (leader_id, self._now_str()))
+            party_id = c.fetchone()[0]
+            c.execute("INSERT INTO fc_party_members (party_id, user_id, joined_at) VALUES (%s, %s, %s)", (party_id, leader_id, self._now_str()))
+            self.conn.commit()
+            return party_id
+        except Exception as e:
+            logger.error(f"Error creating party for {leader_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_get_party_members(self, party_id):
+        """Состав пати: капитан первым. [{user_id, nickname, elo, premium, is_leader}]"""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT m.user_id, p.nickname, COALESCE(s.rating, 0), p.premium_until, (m.user_id = pt.leader_id)
+                   FROM fc_party_members m
+                   JOIN fc_parties pt ON pt.id = m.party_id
+                   JOIN players p ON p.user_id = m.user_id
+                   LEFT JOIN player_stats s ON s.user_id = m.user_id
+                   WHERE m.party_id = %s ORDER BY m.joined_at, m.user_id""",
+                (party_id,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            now_s = self._now_str()
+            members = [
+                {"user_id": r[0], "nickname": r[1], "elo": r[2] or 0, "premium": bool(r[3] and r[3] > now_s), "is_leader": bool(r[4])}
+                for r in rows
+            ]
+            members.sort(key=lambda m: not m["is_leader"])
+            return members
+        except Exception as e:
+            logger.error(f"Error getting party members {party_id}: {e}")
+            self.conn.rollback()
+            return []
+
+    def fc_create_invite(self, party_id, from_id, to_id, limit, ttl_minutes=10):
+        """Приглашение в пати. Возвращает (invite_id, ошибка)."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT leader_id FROM fc_parties WHERE id = %s", (party_id,))
+            row = c.fetchone()
+            if not row or row[0] != from_id:
+                self.conn.commit()
+                return None, "Приглашать может только капитан пати."
+            c.execute("SELECT 1 FROM fc_party_members WHERE user_id = %s", (to_id,))
+            if c.fetchone():
+                self.conn.commit()
+                return None, "Этот игрок уже состоит в пати."
+            c.execute("SELECT COUNT(*) FROM fc_party_members WHERE party_id = %s", (party_id,))
+            if c.fetchone()[0] >= limit:
+                self.conn.commit()
+                return None, "Пати заполнена."
+            since = (datetime.now() - timedelta(minutes=ttl_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+            c.execute(
+                "SELECT 1 FROM fc_party_invites WHERE party_id = %s AND to_id = %s AND status = 'pending' AND created_at >= %s",
+                (party_id, to_id, since),
+            )
+            if c.fetchone():
+                self.conn.commit()
+                return None, "Приглашение этому игроку уже отправлено."
+            c.execute(
+                "INSERT INTO fc_party_invites (party_id, from_id, to_id, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
+                (party_id, from_id, to_id, self._now_str()),
+            )
+            invite_id = c.fetchone()[0]
+            self.conn.commit()
+            return invite_id, None
+        except Exception as e:
+            logger.error(f"Error creating party invite: {e}")
+            self.conn.rollback()
+            return None, "Ошибка базы данных."
+
+    def fc_get_invite(self, invite_id):
+        """(id, party_id, from_id, to_id, status, created_at) или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "SELECT id, party_id, from_id, to_id, status, created_at FROM fc_party_invites WHERE id = %s", (invite_id,)
+            )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row
+        except Exception as e:
+            logger.error(f"Error getting invite {invite_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_accept_invite(self, invite_id, user_id, max_free, max_premium, ttl_minutes=10):
+        """Игрок принимает приглашение. Возвращает (ok, ошибка, party_id)."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT party_id, to_id, status, created_at FROM fc_party_invites WHERE id = %s", (invite_id,))
+            row = c.fetchone()
+            if not row or row[1] != user_id:
+                self.conn.commit()
+                return False, "Приглашение не найдено.", None
+            party_id, _to, status, created_at = row
+            since = (datetime.now() - timedelta(minutes=ttl_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+            if status != "pending" or (created_at or "") < since:
+                if status == "pending":
+                    c.execute("UPDATE fc_party_invites SET status = 'expired' WHERE id = %s", (invite_id,))
+                self.conn.commit()
+                return False, "Приглашение уже недействительно.", None
+            c.execute("SELECT leader_id FROM fc_parties WHERE id = %s", (party_id,))
+            party = c.fetchone()
+            if not party:
+                c.execute("UPDATE fc_party_invites SET status = 'cancelled' WHERE id = %s", (invite_id,))
+                self.conn.commit()
+                return False, "Пати уже распущена.", None
+            c.execute("SELECT 1 FROM fc_party_members WHERE user_id = %s", (user_id,))
+            if c.fetchone():
+                self.conn.commit()
+                return False, "Вы уже состоите в пати.", None
+            c.execute("SELECT premium_until FROM players WHERE user_id = %s", (party[0],))
+            prem = c.fetchone()
+            limit = max_premium if (prem and prem[0] and prem[0] > self._now_str()) else max_free
+            c.execute("SELECT COUNT(*) FROM fc_party_members WHERE party_id = %s", (party_id,))
+            if c.fetchone()[0] >= limit:
+                self.conn.commit()
+                return False, "В пати уже нет мест.", None
+            c.execute("INSERT INTO fc_party_members (party_id, user_id, joined_at) VALUES (%s, %s, %s)", (party_id, user_id, self._now_str()))
+            c.execute("UPDATE fc_party_invites SET status = 'accepted' WHERE id = %s", (invite_id,))
+            self.conn.commit()
+            return True, None, party_id
+        except Exception as e:
+            logger.error(f"Error accepting invite {invite_id}: {e}")
+            self.conn.rollback()
+            return False, "Ошибка базы данных.", None
+
+    def fc_decline_invite(self, invite_id, user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE fc_party_invites SET status = 'declined' WHERE id = %s AND to_id = %s AND status = 'pending' RETURNING id",
+                (invite_id, user_id),
+            )
+            ok = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return ok
+        except Exception as e:
+            logger.error(f"Error declining invite {invite_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_leave_party(self, user_id):
+        """Участник (не капитан) выходит из пати. Возвращает id пати или None."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute(
+                """SELECT m.party_id FROM fc_party_members m JOIN fc_parties p ON p.id = m.party_id
+                   WHERE m.user_id = %s AND p.leader_id <> %s""",
+                (user_id, user_id),
+            )
+            row = c.fetchone()
+            if not row:
+                self.conn.commit()
+                return None
+            c.execute("DELETE FROM fc_party_members WHERE user_id = %s", (user_id,))
+            self.conn.commit()
+            return row[0]
+        except Exception as e:
+            logger.error(f"Error leaving party {user_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_disband_party(self, party_id):
+        """Капитан распускает пати: все (и он сам) освобождаются. Возвращает список бывших участников."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT user_id FROM fc_party_members WHERE party_id = %s", (party_id,))
+            members = [r[0] for r in c.fetchall()]
+            c.execute("DELETE FROM fc_party_members WHERE party_id = %s", (party_id,))
+            c.execute("DELETE FROM fc_parties WHERE id = %s", (party_id,))
+            c.execute("UPDATE fc_party_invites SET status = 'cancelled' WHERE party_id = %s AND status = 'pending'", (party_id,))
+            self.conn.commit()
+            return members
+        except Exception as e:
+            logger.error(f"Error disbanding party {party_id}: {e}")
+            self.conn.rollback()
+            return []
+
+    # ======================================================================
+    # НАКАЗАНИЯ: мут / бан / варны
+    # ======================================================================
+    def fc_add_punishment(self, user_id, kind, until, reason, by_id, by_name):
+        """kind: 'mute' или 'ban'. until=None — навсегда (только для бана). Заменяет прежнее наказание того же вида."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("UPDATE fc_punishments SET active = FALSE WHERE user_id = %s AND kind = %s AND active = TRUE", (user_id, kind))
+            c.execute(
+                """INSERT INTO fc_punishments (user_id, kind, until, reason, by_id, by_name, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (user_id, kind, until, reason, by_id, by_name, self._now_str()),
+            )
+            punishment_id = c.fetchone()[0]
+            self.conn.commit()
+            return punishment_id
+        except Exception as e:
+            logger.error(f"Error adding punishment {kind} for {user_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_get_active_punishment(self, user_id, kind):
+        """(until, reason, by_name) действующего наказания или None. Истёкшие закрываются автоматически."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute(
+                """SELECT id, until, reason, by_name FROM fc_punishments
+                   WHERE user_id = %s AND kind = %s AND active = TRUE ORDER BY id DESC LIMIT 1""",
+                (user_id, kind),
+            )
+            row = c.fetchone()
+            if not row:
+                self.conn.commit()
+                return None
+            if row[1] is not None and row[1] <= self._now_str():
+                c.execute("UPDATE fc_punishments SET active = FALSE WHERE id = %s", (row[0],))
+                self.conn.commit()
+                return None
+            self.conn.commit()
+            return row[1], row[2], row[3]
+        except Exception as e:
+            logger.error(f"Error getting punishment {kind} for {user_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def fc_remove_punishment(self, user_id, kind):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE fc_punishments SET active = FALSE WHERE user_id = %s AND kind = %s AND active = TRUE RETURNING id",
+                (user_id, kind),
+            )
+            removed = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return removed
+        except Exception as e:
+            logger.error(f"Error removing punishment {kind} for {user_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def fc_add_warn(self, user_id, limit=3):
+        """+1 варн. Возвращает (текущее число, достигнут_лимит). При достижении лимита варны сбрасываются."""
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("INSERT INTO fc_warns (user_id, count) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+            c.execute("UPDATE fc_warns SET count = count + 1 WHERE user_id = %s", (user_id,))
+            c.execute("SELECT count FROM fc_warns WHERE user_id = %s", (user_id,))
+            count = c.fetchone()[0]
+            reached = count >= limit
+            if reached:
+                c.execute("UPDATE fc_warns SET count = 0 WHERE user_id = %s", (user_id,))
+            self.conn.commit()
+            return count, reached
+        except Exception as e:
+            logger.error(f"Error adding warn for {user_id}: {e}")
+            self.conn.rollback()
+            return 0, False
+
+    def fc_get_warns(self, user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT count FROM fc_warns WHERE user_id = %s", (user_id,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row[0] if row else 0
+        except Exception as e:
+            logger.error(f"Error getting warns for {user_id}: {e}")
+            self.conn.rollback()
+            return 0
+
+    def fc_clear_warns(self, user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("UPDATE fc_warns SET count = 0 WHERE user_id = %s", (user_id,))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing warns for {user_id}: {e}")
+            self.conn.rollback()
+            return False
 
     def create_indexes(self):
         try:
