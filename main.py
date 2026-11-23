@@ -158,6 +158,19 @@ PREMIUM_EMOJI = {
     "🏁": ("5411520005386806155", "🏁"),
     "🥇": ("5440539497383087970", "🥇"),
     "🥈": ("5447203607294265305", "🥈"),
+    # ---- ниже: эмодзи, добавленные при перекраске кнопок ----
+    "🎟": ("5461139258991586684", "🎟"),
+    "🎫": ("5461141084375750925", "🎫"),
+    "📅": ("5431897022456145283", "📅"),
+    "♻️": ("5445267414562389170", "♻️"),
+    "🙋": ("5440431182602842059", "🙋"),
+    "🔒": ("5257949548015576785", "🔒"),
+    "📢": ("5445267414562389170", "📢"),
+    "💬": ("5334882760735598374", "💬"),
+    "🎁": ("5461151367559141950", "🎁"),
+    "📱": ("5257949548015576785", "📱"),
+    "💻": ("5257949548015576785", "💻"),
+    "⚡️": ("5447644880824181073", "⚡️"),
 }
 
 def pe(emoji: str) -> str:
@@ -178,7 +191,7 @@ def pe_icon(emoji: str):
         return None
     return entry[0]
 
-def btn(text: str, callback_data: str = None, url: str = None, icon: str = None):
+def btn(text: str, callback_data: str = None, url: str = None, icon: str = None, style: str = None):
     """Хелпер для InlineKeyboardButton с премиум-иконкой.
 
     Важно: если задан icon и для него есть премиум-ID, то ведущий эмодзи
@@ -190,8 +203,15 @@ def btn(text: str, callback_data: str = None, url: str = None, icon: str = None)
         kwargs["callback_data"] = callback_data
     if url is not None:
         kwargs["url"] = url
+    if style is not None:
+        kwargs["style"] = style
 
-    clean_text = text
+    clean_text = _swap_btn_emoji(text)
+    # если эмодзи в тексте был заменён, а отдельная иконка не задана —
+    # красим кнопку новым эмодзи автоматически
+    if not icon and clean_text != text:
+        icon = clean_text.split()[0] if clean_text else None
+
     if icon:
         eid = pe_icon(icon)
         if eid:
@@ -207,7 +227,73 @@ def btn(text: str, callback_data: str = None, url: str = None, icon: str = None)
                         clean_text = clean_text[len(pref):].lstrip()
                         break
 
+    style = kwargs.pop("style", None) or guess_btn_style(clean_text, callback_data=kwargs.get("callback_data"), url=kwargs.get("url"))
+    if style:
+        kwargs["style"] = style
     return InlineKeyboardButton(text=clean_text, **kwargs)
+
+# ---- ЦВЕТНЫЕ КНОПКИ (Bot API 7.7+, button_type без премиума) ----
+# aiogram 3.25: у InlineKeyboardButton есть поле `style`:
+#   "success" -> зелёная, "danger" -> красная, обычный стиль -> синяя (по умолчанию).
+# Красим по первому эмодзи текста + служебные коллбэки. Ничего не ломает:
+# неподдерживающие клиенты просто игнорируют неизвестное поле и видят обычные кнопки.
+BTN_STYLE_BY_EMOJI = {
+    # 🟢 успех / подтверждение / действие
+    "✅": "success", "🎮": "success", "🕹": "success", "🚀": "success",
+    "⚔️": "success", "⚔": "success", "🏆": "success", "🎯": "success",
+    "💳": "success", "📤": "success", "⭐": "success", "🔋": "success",
+    "✔️": "success", "✔": "success", "🥇": "success", "💪": "success",
+    "🤝": "success", "🔍": "success", "📊": "success", "🎁": "success",
+    "🎟": "success", "📝": "success", "🛠": "success", "🧩": "success",
+    # 🔴 опасность / удаление / отмена матча
+    "❌": "danger", "🗑": "danger", "🚫": "danger", "⛔": "danger",
+    "💣": "danger", "🔻": "danger", "😡": "danger", "🩸": "danger",
+    "💀": "danger", "🧨": "danger", "🪓": "danger", "⚠️": "danger", "⚠": "danger",
+    # ⚪ нейтральные (остаются серыми/обычными — не красим)
+    "ℹ️": None, "ℹ": None, "📋": None, "📜": None, "🧾": None,
+}
+# Ведущие символы без эмодзи-вариатора (снимаем U+FE0F перед поиском)
+BTN_STYLE_PREFIXES = tuple(
+    e.rstrip("\ufe0f") for e in BTN_STYLE_BY_EMOJI if BTN_STYLE_BY_EMOJI[e] is not None
+)
+
+def guess_btn_style(text: str, callback_data: str = None, url: str = None):
+    """Подбирает цвет кнопки по тексту/коллбэку. Возвращает 'success'/'danger'/None."""
+    t = text.lstrip("\ufe0f ")
+    base = t.rstrip("\ufe0f")
+    for pref in BTN_STYLE_PREFIXES:
+        if base.startswith(pref):
+            return BTN_STYLE_BY_EMOJI[pref]
+    cd = callback_data or ""
+    if cd.startswith(("fcjoin_", "ticket_")):
+        return "success"
+    if cd.startswith(("fcban_", "fcleave_", "fccancel_")):
+        return "danger"
+    return None
+# ---- END BUTTON STYLES ----
+
+# ---- РЕЕСТР ЗАМЕН: "перекраска" обычных эмодзи в премиум-иконки ----
+# Меняет только ЭМОДЗИ в тексте кнопок — текст, callback_data и URL не трогаются.
+# Формат: старый_эмодзи -> новый_эмодзи (из PREMIUM_EMOJI).
+BTN_ICON_SWAP = {
+    "🎮": "🕹",   # игровые режимы -> джойстик
+    "⚠️": "🧨",   # предупреждения
+    "🗑": "🪓",    # удаление/сброс
+}
+PREMIUM_EMOJI.setdefault("🕹", ("5467583879948803288", "🕹"))
+PREMIUM_EMOJI.setdefault("🧨", ("5447644880824181073", "🧨"))
+PREMIUM_EMOJI.setdefault("🪓", ("5445267414562389170", "🪓"))
+
+def _swap_btn_emoji(text: str) -> str:
+    """Заменяет ведущий эмодзи кнопки по BTN_ICON_SWAP (только сам эмодзи!)."""
+    for old, new in BTN_ICON_SWAP.items():
+        if text.startswith(old):
+            return new + text[len(old):]
+        for suffix in ("️", ""):
+            pref = old + suffix
+            if text.startswith(pref):
+                return new + text[len(pref):]
+    return text
 # ---- END PREMIUM EMOJI ----
 
 if not BOT_TOKEN:
@@ -361,7 +447,7 @@ def get_player_level(rating):
 
 def get_registration_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[
-        btn("📝 Зарегистрироваться", callback_data="register", icon="📝")
+        btn("📝 Зарегистрироваться", style="success", callback_data="register", icon="📝")
     ]])
 
 
@@ -372,7 +458,7 @@ def get_back_keyboard():
 
 def get_cancel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[
-        btn("❌ Отмена", callback_data="cancel_registration", icon="❌")
+        btn("❌ Отмена", style="danger", callback_data="cancel_registration", icon="❌")
     ]])
 
 
@@ -399,8 +485,8 @@ def get_premium_period_keyboard(user_id=None):
         [btn(label_30, callback_data="premium_pick_30", icon="🗓")],
         [btn(label_90, callback_data="premium_pick_90", icon="📆")],
         [
-            btn("🎟 Промокод", callback_data="promo_enter", icon="🎟"),
-            btn("🎁 Подарить Premium", callback_data="gift_start", icon="🎁"),
+            btn("🎟 Промокод", style="success", callback_data="promo_enter", icon="🎟"),
+            btn("🎁 Подарить Premium", style="success", callback_data="gift_start", icon="🎁"),
         ],
         [btn("◀️ Назад", callback_data="back_to_main", icon="◀️")],
     ])
@@ -409,14 +495,14 @@ def get_premium_payment_keyboard(days: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             btn("💲 CryptoBot", callback_data=f"premium_pay_crypto_{days}", icon="💲"),
-            btn("⭐️ Telegram Stars", callback_data=f"premium_pay_stars_{days}", icon="⭐️"),
+            btn("⭐️ Telegram Stars", style="success", callback_data=f"premium_pay_stars_{days}", icon="⭐️"),
         ],
         [btn("◀️ Назад", callback_data="premium_menu", icon="◀️")],
     ])
 
 def get_cancel_edit_profile_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[
-        btn("❌ Отмена", callback_data="cancel_edit_profile", icon="❌")
+        btn("❌ Отмена", style="danger", callback_data="cancel_edit_profile", icon="❌")
     ]])
 
 
@@ -737,8 +823,8 @@ async def cmd_post(message: types.Message, state: FSMContext):
 
     confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            btn("✅ Да, отправить", callback_data="confirm_broadcast", icon="✅"),
-            btn("❌ Отмена", callback_data="cancel_broadcast", icon="❌")
+            btn("✅ Да, отправить", style="success", callback_data="confirm_broadcast", icon="✅"),
+            btn("❌ Отмена", style="danger", callback_data="cancel_broadcast", icon="❌")
         ]
     ])
 
@@ -1006,7 +1092,7 @@ async def start_crypto_payment(callback_query, days, recipient_id=None):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [btn("💲 Оплатить в CryptoBot", url=pay_url, icon="💲")],
-            [btn("🔍 Проверить оплату", callback_data=f"pcheck_{order_id}", icon="🔍")],
+            [btn("🔍 Проверить оплату", style="success", callback_data=f"pcheck_{order_id}", icon="🔍")],
             [btn("◀️ Назад", callback_data=back_cb, icon="◀️")],
         ]
     )
@@ -1503,7 +1589,7 @@ async def gift_pick(callback_query: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             btn("💲 CryptoBot", callback_data=f"gift_pay_crypto_{target}_{days}", icon="💲"),
-            btn("⭐️ Telegram Stars", callback_data=f"gift_pay_stars_{target}_{days}", icon="⭐️"),
+            btn("⭐️ Telegram Stars", style="success", callback_data=f"gift_pay_stars_{target}_{days}", icon="⭐️"),
         ],
         [btn("◀️ Назад", callback_data=f"gift_to_{target}", icon="◀️")],
     ])
@@ -1714,11 +1800,11 @@ def player_label(user_id):
 
 def owner_main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="own_stats")],
-        [InlineKeyboardButton(text="🔍 Найти игрока", callback_data="own_search")],
+        [InlineKeyboardButton(text="📊 Статистика", style="success", callback_data="own_stats")],
+        [InlineKeyboardButton(text="🔍 Найти игрока", style="success", callback_data="own_search")],
         [InlineKeyboardButton(text="👮 Админы", callback_data="own_admins")],
-        [InlineKeyboardButton(text="🎟 Промокоды", callback_data="own_promos")],
-        [InlineKeyboardButton(text="❌ Закрыть", callback_data="own_close")],
+        [InlineKeyboardButton(text="🎟 Промокоды", style="success", callback_data="own_promos")],
+        [InlineKeyboardButton(text="❌ Закрыть", style="danger", callback_data="own_close")],
     ])
 
 
@@ -1729,9 +1815,9 @@ def owner_card_keyboard(uid):
             InlineKeyboardButton(text="🔄 Обновить", callback_data=f"own_card_{uid}"),
         ],
         [
-            InlineKeyboardButton(text="⭐ +30 дн.", callback_data=f"own_prem_{uid}_30"),
-            InlineKeyboardButton(text="⭐ +90 дн.", callback_data=f"own_prem_{uid}_90"),
-            InlineKeyboardButton(text="🗑 Снять", callback_data=f"own_unprem_{uid}"),
+            InlineKeyboardButton(text="⭐ +30 дн.", style="success", callback_data=f"own_prem_{uid}_30"),
+            InlineKeyboardButton(text="⭐ +90 дн.", style="success", callback_data=f"own_prem_{uid}_90"),
+            InlineKeyboardButton(text="🗑 Снять", style="danger", callback_data=f"own_unprem_{uid}"),
         ],
         [InlineKeyboardButton(text="◀️ В панель", callback_data="own_menu")],
     ])
@@ -1991,7 +2077,7 @@ async def own_admins(callback_query: types.CallbackQuery, state: FSMContext = No
             tag = ""
         lines.append(f"• {nick} ({uid}){tag}")
         if not is_owner(uid) and uid not in FILE_ADMINS:
-            rows.append([InlineKeyboardButton(text=f"❌ Убрать: {nick}", callback_data=f"own_admin_del_{uid}")])
+            rows.append([InlineKeyboardButton(text=f"❌ Убрать: {nick}", style="danger", callback_data=f"own_admin_del_{uid}")])
     lines.append("\nАдмины из admins.txt убираются только правкой файла.")
     rows.append([InlineKeyboardButton(text="➕ Добавить админа", callback_data="own_admin_add")])
     rows.append([InlineKeyboardButton(text="◀️ В панель", callback_data="own_menu")])
@@ -2191,7 +2277,7 @@ async def own_promo_value(message: types.Message, state: FSMContext):
         f"лимит: {max_uses or 'без лимита'}"
         f"{', действует ' + str(valid_days) + ' дн.' if valid_days else ''}\n\n"
         "Игроки вводят его в меню Premium → «Промокод».",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎟 К списку промокодов", callback_data="own_promos")]]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎟 К списку промокодов", style="success", callback_data="own_promos")]]),
     )
 
 
@@ -2366,12 +2452,12 @@ def render_lobby(lobby_id, user_id):
             lines.append(f"{i}. —")
         if me:
             kb = InlineKeyboardMarkup(inline_keyboard=[
-                [btn("🚪 Выйти из лобби", callback_data=f"fcleave_{lobby_id}", icon="🚪")],
+                [btn("🚪 Выйти из лобби", style="danger", callback_data=f"fcleave_{lobby_id}", icon="🚪")],
                 [btn("◀️ В меню", callback_data="back_to_main", icon="◀️")],
             ])
         else:
             kb = InlineKeyboardMarkup(inline_keyboard=[
-                [btn("✅ Присоединиться", callback_data=f"fcjoin_{lobby_id}", icon="✅")],
+                [btn("✅ Присоединиться", style="success", callback_data=f"fcjoin_{lobby_id}", icon="✅")],
                 [btn("🔄 Обновить", callback_data=f"fcview_{lobby_id}", icon="🔄")],
                 [btn("◀️ К списку лобби", callback_data=f"fclist_{mode}", icon="◀️")],
             ])
@@ -2683,8 +2769,8 @@ async def fc_join_confirm(callback_query: types.CallbackQuery):
         + (f"\n{pe('👥')} Заходит вся пати: {party_size}" if party_size > 1 else "")
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("✅ Подтвердить", callback_data=f"fcjoinok_{lobby_id}", icon="✅"),
-         btn("❌ Отмена", callback_data=f"fcview_{lobby_id}", icon="❌")],
+        [btn("✅ Подтвердить", style="success", callback_data=f"fcjoinok_{lobby_id}", icon="✅"),
+         btn("❌ Отмена", style="danger", callback_data=f"fcview_{lobby_id}", icon="❌")],
     ])
     try:
         await callback_query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
@@ -2840,7 +2926,7 @@ def topic_keyboard(lobby_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [btn("🔵 Победа CT", callback_data=f"fcwin_{lobby_id}_ct"),
          btn("🟠 Победа T", callback_data=f"fcwin_{lobby_id}_t")],
-        [btn("❌ Отменить матч", callback_data=f"fccancel_{lobby_id}", icon="❌")],
+        [btn("❌ Отменить матч", style="danger", callback_data=f"fccancel_{lobby_id}", icon="❌")],
     ])
 
 
@@ -2978,7 +3064,7 @@ async def fc_screenshot_start(callback_query: types.CallbackQuery, state: FSMCon
         user_id,
         f"{pe('📸')} Отправьте скриншот с итоговым счётом матча #{lobby_id} одним фото.",
         None,
-        InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data=f"fcshot_cancel", icon="❌")]]),
+        InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", style="danger", callback_data=f"fcshot_cancel", icon="❌")]]),
     )
     await callback_query.answer()
 
@@ -3008,7 +3094,7 @@ async def fc_screenshot_received(message: types.Message, state: FSMContext):
         await cleanup_user_messages(user_id)
         await send_message_with_image(
             user_id, f"{pe('❌')} Нужно отправить фото (скриншот) одним сообщением.", None,
-            InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="fcshot_cancel", icon="❌")]]),
+            InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", style="danger", callback_data="fcshot_cancel", icon="❌")]]),
         )
         return
     lobby = db.fc_get_lobby(lobby_id) if lobby_id else None
@@ -3034,7 +3120,7 @@ async def fc_screenshot_received(message: types.Message, state: FSMContext):
         await cleanup_user_messages(user_id)
         await send_message_with_image(
             user_id, f"{pe('❌')} Не удалось отправить скриншот модераторам, попробуйте ещё раз.", None,
-            InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="fcshot_cancel", icon="❌")]]),
+            InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", style="danger", callback_data="fcshot_cancel", icon="❌")]]),
         )
         return
     db.kv_set(f"fcshot:{lobby_id}:{user_id}", 1)
@@ -3108,7 +3194,7 @@ async def fc_win_confirm(callback_query: types.CallbackQuery):
         await callback_query.answer()
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        btn("✅ Да, начислить", callback_data=f"fcwinok_{lobby_id}_{team}", icon="✅"),
+        btn("✅ Да, начислить", style="success", callback_data=f"fcwinok_{lobby_id}_{team}", icon="✅"),
         btn("◀️ Нет", callback_data=f"fcwinno_{lobby_id}", icon="◀️"),
     ]])
     try:
@@ -3191,8 +3277,8 @@ async def post_match_to_channel(lobby_id, results):
     link = await make_bot_link()
     kb = plain_kb = None
     if link:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[btn("🎮 Играть в боте", url=link, icon="🎮")]])
-        plain_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎮 Играть в боте", url=link)]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[btn("🎮 Играть в боте", style="success", url=link, icon="🎮")]])
+        plain_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎮 Играть в боте", style="success", url=link)]])
     try:
         await bot.send_message(chat_id=CHANNEL_ID, text=text, reply_markup=kb, parse_mode='HTML')
     except Exception as e:
@@ -3421,7 +3507,7 @@ def _history_filter_label(mode, map_name, days):
 
 def _history_filter_menu_keyboard(user_id, mode_idx, map_idx, days, offset):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("🎮 Выбрать режим (2×2 / 5×5)", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "mode"), icon="🎮")],
+        [btn("🎮 Выбрать режим (2×2 / 5×5)", style="success", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "mode"), icon="🎮")],
         [btn("🗺 Выбрать карту", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "map"), icon="🗺")],
         [btn("📅 Период", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "period"), icon="📅")],
         [btn("♻️ Сбросить фильтры", callback_data=_history_filter_state(user_id, -1, -1, 0, 0, "apply"), icon="♻️")],
@@ -3537,7 +3623,7 @@ class TicketStates(StatesGroup):
 
 
 def ticket_cancel_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", callback_data="ticket_cancel", icon="❌")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("❌ Отмена", style="danger", callback_data="ticket_cancel", icon="❌")]])
 
 
 def ticket_number(ticket_id):
@@ -3567,7 +3653,7 @@ async def begin_ticket(user_id, state):
         [InlineKeyboardButton(text=f"#{lobby_id} · {fc_title(mode)} · {map_name or '—'}", callback_data=f"ticket_m_{lobby_id}")]
         for lobby_id, mode, map_name, _status, _finished in matches
     ]
-    rows.append([btn("❌ Отмена", callback_data="ticket_cancel", icon="❌")])
+    rows.append([btn("❌ Отмена", style="danger", callback_data="ticket_cancel", icon="❌")])
     text = (
         f"{pe('🎫')} <b>Тикет · шаг 1 из 4</b> — выберите матч"
     )
@@ -3616,8 +3702,8 @@ def player_buttons_keyboard(lobby_id, user_id):
 
 def reason_keyboard(lobby_id):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        btn("◀️ К игрокам", callback_data=f"ticket_m_{lobby_id}", icon="◀️"),
-        btn("❌ Отмена", callback_data="ticket_cancel", icon="❌"),
+        btn("◀️ К игрокам", style="success", callback_data=f"ticket_m_{lobby_id}", icon="◀️"),
+        btn("❌ Отмена", style="danger", callback_data="ticket_cancel", icon="❌"),
     ]])
 
 
@@ -4370,9 +4456,9 @@ def render_party(user_id, note=None):
     if is_leader:
         rows = [
             [btn("➕ Пригласить игрока", callback_data="party_invite", icon="➕")],
-            [btn("🔍 Найти матч", callback_data="fcfind", icon="🔍")],
+            [btn("🔍 Найти матч", style="success", callback_data="fcfind", icon="🔍")],
             [
-                btn("🗑 Распустить пати", callback_data="party_disband", icon="🗑"),
+                btn("🗑 Распустить пати", style="danger", callback_data="party_disband", icon="🗑"),
                 btn("◀️ В меню", callback_data="back_to_main", icon="◀️"),
             ],
         ]
@@ -4529,8 +4615,8 @@ async def party_invitee_entered(message: types.Message, state: FSMContext):
     inviter = db.get_player_profile(user_id)
     inviter_nick = inviter[2] if inviter else str(user_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        btn("✅ Принять", callback_data=f"pinv_ok_{invite_id}", icon="✅"),
-        btn("❌ Отклонить", callback_data=f"pinv_no_{invite_id}", icon="❌"),
+        btn("✅ Принять", style="success", callback_data=f"pinv_ok_{invite_id}", icon="✅"),
+        btn("❌ Отклонить", style="danger", callback_data=f"pinv_no_{invite_id}", icon="❌"),
     ]])
     target_profile = db.get_player_profile(target)
     target_nick = target_profile[2] if target_profile else str(target)
@@ -4642,7 +4728,7 @@ def reg_keyboard(back=None):
     rows = []
     if back:
         rows.append([btn("◀️ Назад", callback_data=back, icon="◀️")])
-    rows.append([btn("❌ Отмена", callback_data="cancel_registration", icon="❌")])
+    rows.append([btn("❌ Отмена", style="danger", callback_data="cancel_registration", icon="❌")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -4681,7 +4767,7 @@ async def ask_device(user_id):
             btn("💻 ПК", callback_data="reg_dev_pc", icon="💻"),
         ],
         [btn("◀️ Назад", callback_data="reg_edit_id", icon="◀️")],
-        [btn("❌ Отмена", callback_data="cancel_registration", icon="❌")],
+        [btn("❌ Отмена", style="danger", callback_data="cancel_registration", icon="❌")],
     ])
     await send_message_with_image(user_id, text, None, kb)
 
@@ -4697,13 +4783,13 @@ async def ask_confirm(user_id, nickname, game_id, device):
         f"Всё верно?"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("✅ Подтвердить регистрацию", callback_data="reg_confirm", icon="✅")],
+        [btn("✅ Подтвердить регистрацию", style="success", callback_data="reg_confirm", icon="✅")],
         [
             btn("✏️ Изменить ник", callback_data="reg_edit_nick", icon="✏️"),
             btn("🆔 Изменить ID", callback_data="reg_edit_id"),
         ],
         [btn("📱 Изменить устройство", callback_data="reg_edit_device", icon="📱")],
-        [btn("❌ Отмена", callback_data="cancel_registration", icon="❌")],
+        [btn("❌ Отмена", style="danger", callback_data="cancel_registration", icon="❌")],
     ])
     await send_message_with_image(user_id, text, None, kb)
 
@@ -5084,20 +5170,20 @@ def get_main_keyboard(user_id=None):
     in_match = bool(user_id and db.fc_get_user_active_lobby(user_id))
     find_button = (
         btn("📋 Мой матч / лобби", callback_data="fcfind", icon="📋")
-        if in_match else btn("🔍 Найти матч", callback_data="fcfind", icon="🔍")
+        if in_match else btn("🔍 Найти матч", style="success", callback_data="fcfind", icon="🔍")
     )
     return InlineKeyboardMarkup(inline_keyboard=[
         [find_button],
         [
             btn("👤 Мой профиль", callback_data="profile", icon="👤"),
-            btn("🏆 Топ игроков", callback_data="top", icon="🏆"),
+            btn("🏆 Топ игроков", style="success", callback_data="top", icon="🏆"),
         ],
         [
-            btn("⭐️ Premium", callback_data="premium_menu", icon="⭐️"),
+            btn("⭐️ Premium", style="success", callback_data="premium_menu", icon="⭐️"),
             btn("👥 Пати", callback_data="party", icon="👥"),
         ],
         [
-            btn("🎟 Промокод", callback_data="promo_enter", icon="🎟"),
+            btn("🎟 Промокод", style="success", callback_data="promo_enter", icon="🎟"),
             btn("🎫 Тикет", callback_data="ticket_start", icon="🎫"),
         ],
     ])
