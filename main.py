@@ -158,6 +158,19 @@ PREMIUM_EMOJI = {
     "🏁": ("5411520005386806155", "🏁"),
     "🥇": ("5440539497383087970", "🥇"),
     "🥈": ("5447203607294265305", "🥈"),
+    # ---- ниже: эмодзи, добавленные при перекраске кнопок ----
+    "🎟": ("5461139258991586684", "🎟"),
+    "🎫": ("5461141084375750925", "🎫"),
+    "📅": ("5431897022456145283", "📅"),
+    "♻️": ("5445267414562389170", "♻️"),
+    "🙋": ("5440431182602842059", "🙋"),
+    "🔒": ("5257949548015576785", "🔒"),
+    "📢": ("5445267414562389170", "📢"),
+    "💬": ("5334882760735598374", "💬"),
+    "🎁": ("5461151367559141950", "🎁"),
+    "📱": ("5257949548015576785", "📱"),
+    "💻": ("5257949548015576785", "💻"),
+    "⚡️": ("5447644880824181073", "⚡️"),
 }
 
 def pe(emoji: str) -> str:
@@ -191,7 +204,12 @@ def btn(text: str, callback_data: str = None, url: str = None, icon: str = None)
     if url is not None:
         kwargs["url"] = url
 
-    clean_text = text
+    clean_text = _swap_btn_emoji(text)
+    # если эмодзи в тексте был заменён, а отдельная иконка не задана —
+    # красим кнопку новым эмодзи автоматически
+    if not icon and clean_text != text:
+        icon = clean_text.split()[0] if clean_text else None
+
     if icon:
         eid = pe_icon(icon)
         if eid:
@@ -208,6 +226,28 @@ def btn(text: str, callback_data: str = None, url: str = None, icon: str = None)
                         break
 
     return InlineKeyboardButton(text=clean_text, **kwargs)
+# ---- РЕЕСТР ЗАМЕН: "перекраска" обычных эмодзи в премиум-иконки ----
+# Меняет только ЭМОДЗИ в тексте кнопок — текст, callback_data и URL не трогаются.
+# Формат: старый_эмодзи -> новый_эмодзи (из PREMIUM_EMOJI).
+BTN_ICON_SWAP = {
+    "🎮": "🕹",   # игровые режимы -> джойстик
+    "⚠️": "🧨",   # предупреждения
+    "🗑": "🪓",    # удаление/сброс
+}
+PREMIUM_EMOJI.setdefault("🕹", ("5467583879948803288", "🕹"))
+PREMIUM_EMOJI.setdefault("🧨", ("5447644880824181073", "🧨"))
+PREMIUM_EMOJI.setdefault("🪓", ("5445267414562389170", "🪓"))
+
+def _swap_btn_emoji(text: str) -> str:
+    """Заменяет ведущий эмодзи кнопки по BTN_ICON_SWAP (только сам эмодзи!)."""
+    for old, new in BTN_ICON_SWAP.items():
+        if text.startswith(old):
+            return new + text[len(old):]
+        for suffix in ("️", ""):
+            pref = old + suffix
+            if text.startswith(pref):
+                return new + text[len(pref):]
+    return text
 # ---- END PREMIUM EMOJI ----
 
 if not BOT_TOKEN:
